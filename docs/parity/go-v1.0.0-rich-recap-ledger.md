@@ -16,6 +16,7 @@ tenth ledger column.
 | Rust test cell | Approved plan reference |
 | --- | --- |
 | `config_tests` | Task 2 — Add exact configuration parsing and dependencies |
+| `telegram_endpoint_tests` | Task 2 — Add exact configuration parsing and dependencies |
 | `recap_redis_state_tests` | Task 3 — Implement Redis recap state and callback codecs |
 | `recap_persistence_tests` | Task 4 — Add recap-domain SQL migrations and repositories |
 | `recap_scope_tests` | Task 4 — Add recap-domain SQL migrations and repositories; Task 11 — Port callback router, manual recap, and configuration |
@@ -127,5 +128,5 @@ tenth ledger column.
 | `chat_histories.go:315` | `SQL-028 MigrateChatHistoriesOfChatFromChatIDToChatID` | group-to-supergroup migration | no direct reply | migrate history chat ID and force supergroup type | none | `chat_history::migrate_chat_id` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
 | `chat_histories.go:351` | `SQL-029 FindChatHistoriesByTimeBefore` | manual/automatic recap window | caller enforces history threshold | strict cutoff query sorted by ascending message ID | none | `chat_history::recent_messages_after_cutoff` | `recap_persistence_tests`, `message_capture_tests`, `autorecap_worker_tests` | not-started |
 | `openai.go:89` | `CONFIG-002 NewClient configuration branch` | application startup | shared configured Telegram/OpenAI behavior | none | none | `config::AppConfig::from_lookup` | `config_tests` | task-2-complete |
-| `rich_message.go:45` | `CONFIG-003 custom Telegram endpoint branch` | application startup | ordinary and Rich Bot API share normalized base endpoint | none | none | `config::AppConfig::from_lookup`, `config::TelegramConfig::bot`, `telegram_rich::TelegramRichClient` | `config_tests`, `telegram_rich_tests` | task-2-config-complete; raw transport pending Task 7 |
-| `configs.go:48` | `CONFIG-004 Redis recap connection configuration` | application startup | no direct reply | none | validated `REDIS_HOST`, required bounded `REDIS_PORT`, TLS/auth/DB/client-cache configuration | `config::RedisConfig` | `config_tests` | task-2-complete; concrete state client pending Task 3 |
+| `rich_message.go:45` | `CONFIG-003 custom Telegram endpoint branch` | application startup | ordinary and Rich Bot API share normalized base endpoint | none | none | `config::AppConfig::from_lookup`, `config::TelegramConfig::{api_base,bot}`, `telegram_rich::TelegramRichClient` | `config_tests`, `telegram_endpoint_tests`, `telegram_rich_tests` | task-2-config-complete; raw transport pending Task 7 |
+| `configs.go:48` | `CONFIG-004 Redis recap connection configuration` | application startup | no direct reply | none | required bounded `REDIS_PORT`, TLS/auth/DB/client-cache parsing | `config::RedisConfig` | `config_tests` | task-2-complete; concrete state client pending Task 3 |

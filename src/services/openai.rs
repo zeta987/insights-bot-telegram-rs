@@ -10,14 +10,14 @@ use async_openai::{
 };
 
 use crate::{
-    config::{Locale, OpenAiConfig as OpenAiSettings},
+    config::{CondensedPromptConfig, Locale, OpenAiConfig as OpenAiSettings, RecapOpenAiConfig},
     db::models::ChatHistory,
     i18n::I18n,
     services::prompts::{
-        CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, CHAT_HISTORY_SUMMARIZATION_USER_PROMPT,
-        CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_USER_PROMPT,
-        CHECK_SUMMARY_JSON_SYSTEM_PROMPT, CHECK_SUMMARY_JSON_USER_PROMPT, PromptConfig,
-        StructuredSummary, TopicSummary,
+        CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT,
+        CHECK_CONDENSED_OUTPUT_USER_PROMPT, CHECK_SUMMARY_JSON_SYSTEM_PROMPT,
+        CHECK_SUMMARY_JSON_USER_PROMPT, PromptConfig, StructuredSummary, TopicSummary,
+        render_structured_summary_user_prompt,
     },
 };
 
@@ -33,28 +33,28 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    pub fn new(cfg: &OpenAiSettings) -> Result<Self> {
+    pub fn new(
+        cfg: &OpenAiSettings,
+        recap: &RecapOpenAiConfig,
+        condensed: &CondensedPromptConfig,
+    ) -> Result<Self> {
         let mut builder = OpenAIConfig::new().with_api_key(&cfg.api_key);
         if let Some(base) = &cfg.api_base {
             builder = builder.with_api_base(base);
         }
         let client = Client::with_config(builder);
-        let prompt_config = PromptConfig::from_env();
-        let sarcastic_model = std::env::var("SARCASTIC_CONDENSED_MODEL_NAME").ok();
-        let check_model = std::env::var("CHECK_MODEL")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let check_model_backup = std::env::var("CHECK_MODEL_backup")
-            .ok()
-            .filter(|s| !s.is_empty());
+        let prompt_config = PromptConfig::from_config(recap, condensed);
+        let sarcastic_model = Some(recap.condensed_model.clone());
+        let check_model = recap.check_model.clone();
+        let check_model_backup = recap.check_backups.first().cloned();
 
         Ok(Self {
             client,
-            model: cfg.model.clone(),
+            model: recap.primary_model.clone(),
             sarcastic_model,
             check_model,
             check_model_backup,
-            token_limit: cfg.token_limit,
+            token_limit: u32::try_from(recap.token_limit).ok(),
             prompt_config,
         })
     }
@@ -63,13 +63,13 @@ impl OpenAiClient {
     pub async fn sarcastic_condense(&self, content: &str) -> Result<String> {
         let model = self.sarcastic_model.as_ref().unwrap_or(&self.model).clone();
 
-        let user_prompt = self.prompt_config.render_sarcastic_user_prompt(content);
+        let user_prompt = self.prompt_config.render_sarcastic_user_prompt(content)?;
 
         let req = CreateChatCompletionRequestArgs::default()
             .model(&model)
             .messages(vec![
                 ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: self.prompt_config.render_sarcastic_system_prompt(content).into(),
+                    content: self.prompt_config.sarcastic_system_prompt.clone().into(),
                     name: None,
                 }),
                 ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -113,9 +113,7 @@ impl OpenAiClient {
             Locale::En => "English",
         };
 
-        let user_prompt = CHAT_HISTORY_SUMMARIZATION_USER_PROMPT
-            .replace("{{language}}", language)
-            .replace("{{chat_history}}", content);
+        let user_prompt = render_structured_summary_user_prompt(language, content)?;
 
         let req = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
@@ -258,8 +256,7 @@ impl OpenAiClient {
         }
         trace.attempted = true;
 
-        let user_prompt =
-            CHECK_CONDENSED_OUTPUT_USER_PROMPT.replace("{{raw_output}}", raw_output);
+        let user_prompt = CHECK_CONDENSED_OUTPUT_USER_PROMPT.replace("{{raw_output}}", raw_output);
 
         // Try primary check model
         if let Ok(repaired) = self
@@ -280,11 +277,7 @@ impl OpenAiClient {
         if let Some(backup) = &self.check_model_backup {
             trace.backup_used = true;
             if let Ok(repaired) = self
-                .call_check_model(
-                    backup,
-                    CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT,
-                    &user_prompt,
-                )
+                .call_check_model(backup, CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT, &user_prompt)
                 .await
                 && !needs_condensed_repair(&repaired)
             {
@@ -452,8 +445,16 @@ pub struct RecapTrace {
 impl RecapTrace {
     /// Build the three-line model status footer, joined by newline.
     pub fn build_status_lines(&self, locale: &Locale, i18n: &I18n) -> String {
-        let condensed_line = i18n.t(*locale, "footer.condensed", &[("model", &self.condensed_model)]);
-        let segmented_line = i18n.t(*locale, "footer.segmented", &[("model", &self.segmented_model)]);
+        let condensed_line = i18n.t(
+            *locale,
+            "footer.condensed",
+            &[("model", &self.condensed_model)],
+        );
+        let segmented_line = i18n.t(
+            *locale,
+            "footer.segmented",
+            &[("model", &self.segmented_model)],
+        );
         let check_line = self.format_check_line(locale, i18n);
         format!("{}\n{}\n{}", condensed_line, segmented_line, check_line)
     }
@@ -467,14 +468,20 @@ impl RecapTrace {
             return i18n.t(
                 *locale,
                 "footer.check_backup_success",
-                &[("model", &check.model), ("backup_model", &check.backup_model)],
+                &[
+                    ("model", &check.model),
+                    ("backup_model", &check.backup_model),
+                ],
             );
         }
         if check.attempted && check.failed && check.backup_used {
             return i18n.t(
                 *locale,
                 "footer.check_backup_failed",
-                &[("model", &check.model), ("backup_model", &check.backup_model)],
+                &[
+                    ("model", &check.model),
+                    ("backup_model", &check.backup_model),
+                ],
             );
         }
         if check.attempted && check.failed {
@@ -484,7 +491,11 @@ impl RecapTrace {
             return i18n.t(*locale, "footer.check_success", &[("model", &check.model)]);
         }
         // Not attempted = not triggered
-        i18n.t(*locale, "footer.check_not_triggered", &[("model", &check.model)])
+        i18n.t(
+            *locale,
+            "footer.check_not_triggered",
+            &[("model", &check.model)],
+        )
     }
 }
 
@@ -595,7 +606,9 @@ pub fn format_topics_to_telegram_html(
         if topic.since_id > 0 {
             output.push(format!(
                 "<b><a href=\"https://t.me/c/{}/{}\">{}</a></b>",
-                chat_cid, topic.since_id, escape_html(&topic.topic_name)
+                chat_cid,
+                topic.since_id,
+                escape_html(&topic.topic_name)
             ));
         } else {
             output.push(format!("<b>{}</b>", escape_html(&topic.topic_name)));
@@ -608,7 +621,10 @@ pub fn format_topics_to_telegram_html(
             .map(|p| escape_html(p))
             .collect::<Vec<_>>()
             .join(&comma);
-        output.push(format!("{}{}{}", participants_label, colon, participants_str));
+        output.push(format!(
+            "{}{}{}",
+            participants_label, colon, participants_str
+        ));
 
         // Discussion
         output.push(format!("{}{}", discussion_label, colon));
@@ -621,7 +637,9 @@ pub fn format_topics_to_telegram_html(
                 .map(|(i, id)| {
                     format!(
                         "<a href=\"https://t.me/c/{}/{}\">[{}]</a>",
-                        chat_cid, id, i + 1
+                        chat_cid,
+                        id,
+                        i + 1
                     )
                 })
                 .collect();

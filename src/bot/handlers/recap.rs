@@ -376,10 +376,10 @@ impl RecapHandlers {
             bot.answer_callback_query(callback_id).await?;
             return Ok(());
         };
-        let tg_chat_id = original_msg.chat.id;
-        let original_msg_id = original_msg.id;
+        let tg_chat_id = original_msg.chat().id;
+        let original_msg_id = original_msg.id();
         let chat_title = original_msg
-            .chat
+            .chat()
             .title()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Chat".to_string());
@@ -565,7 +565,7 @@ impl RecapHandlers {
         }
 
         // Best-effort admin check.
-        if let Some(from) = msg.from()
+        if let Some(from) = msg.from.as_ref()
             && let Err(err) = bot.get_chat_member(chat_id, from.id).await
         {
             warn!("admin check skipped: {err:?}");
@@ -599,8 +599,8 @@ impl RecapHandlers {
         let Some(msg) = q.message else {
             return Ok(());
         };
-        let chat_id = msg.chat.id;
-        let message_id = msg.id;
+        let chat_id = msg.chat().id;
+        let message_id = msg.id();
         let data = q.data.clone().unwrap_or_default();
         let parts: Vec<&str> = data.split(':').collect();
         if parts.len() < 2 || parts[0] != "cfg" {

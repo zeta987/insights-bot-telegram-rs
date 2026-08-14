@@ -46,9 +46,9 @@ pub async fn record_message(ctx: Arc<AppContext>, msg: Message) {
 
     let created_at = msg.date.timestamp();
     let chat_id = msg.chat.id.0;
-    let from_id = msg.from().map(|u| u.id.0 as i64);
+    let from_id = msg.from.as_ref().map(|u| u.id.0 as i64);
     // Extract full name (first_name + last_name)
-    let from_full_name = msg.from().map(|u| {
+    let from_full_name = msg.from.as_ref().map(|u| {
         let mut name = u.first_name.clone();
         if let Some(ref last) = u.last_name {
             name.push(' ');
@@ -56,11 +56,12 @@ pub async fn record_message(ctx: Arc<AppContext>, msg: Message) {
         }
         name
     });
-    let from_username = msg.from().and_then(|u| u.username.clone());
+    let from_username = msg.from.as_ref().and_then(|u| u.username.clone());
 
     let preview = text.clone().unwrap_or_else(|| "<non-text>".to_string());
     let from = msg
-        .from()
+        .from
+        .as_ref()
         .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
         .unwrap_or_else(|| "<unknown>".to_string());
 

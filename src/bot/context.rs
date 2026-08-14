@@ -17,7 +17,7 @@ pub struct AppContext {
     pub telegraph: Option<TelegraphService>,
     /// Task 3 installs the concrete Redis-backed recap state client here.
     pub recap_redis_client: Option<redis::Client>,
-    /// Shared HTTP transport for Task 4's raw Telegram Rich Message client.
+    /// Shared HTTP transport for Task 7's raw Telegram Rich Message client.
     pub raw_telegram_http: reqwest::Client,
 }
 
@@ -25,7 +25,7 @@ pub struct AppContext {
 pub struct RecapRuntimeDependencies {
     /// Task 3 installs the concrete Redis-backed recap state client here.
     pub recap_redis_client: Option<redis::Client>,
-    /// Shared HTTP transport for Task 4's raw Telegram Rich Message client.
+    /// Shared HTTP transport for Task 7's raw Telegram Rich Message client.
     pub raw_telegram_http: reqwest::Client,
 }
 

@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use insights_bot_telegram_rs::config::AppConfig;
+use insights_bot_telegram_rs::{
+    config::AppConfig,
+    services::prompts::{PromptConfig, render_structured_summary_user_prompt},
+};
 
 fn config(values: &[(&str, &str)]) -> anyhow::Result<AppConfig> {
     let values = values
@@ -233,6 +236,118 @@ fn config_rejects_malformed_condensed_user_template() {
         .err()
         .expect("malformed template must be rejected");
     assert!(err.to_string().contains("SARCASTIC_CONDENSED_USER_PROMPT"));
+}
+
+#[test]
+fn config_uses_a_go_template_engine_for_validation_and_rendering() {
+    for template in [
+        "History: {{ .ChatHistory }}",
+        r#"{{printf "}}"}}"#,
+        "{{/* }} */}}",
+    ] {
+        let mut values = required_values();
+        values.push(("SARCASTIC_CONDENSED_USER_PROMPT", template));
+        let cfg = config(&values).expect("valid Go template should load");
+        let rendered = cfg
+            .condensed_prompts
+            .render_user("a rendered chat history")
+            .expect("validated template should render");
+        if template.contains("ChatHistory") {
+            assert_eq!(rendered, "History: a rendered chat history");
+        }
+    }
+
+    for template in [
+        "{{if}}x{{end}}",
+        "{{unknown}}",
+        "{{printf \"x}}",
+        "{{/* unclosed }}",
+    ] {
+        let mut values = required_values();
+        values.push(("SARCASTIC_CONDENSED_USER_PROMPT", template));
+        let err = config(&values)
+            .err()
+            .expect("invalid Go template must be rejected");
+        assert_eq!(
+            err.to_string(),
+            "SARCASTIC_CONDENSED_USER_PROMPT is invalid"
+        );
+        assert!(!err.to_string().contains(template));
+    }
+}
+
+#[test]
+fn default_condensed_prompt_renders_with_the_go_template_engine() {
+    let rendered = PromptConfig::default()
+        .render_sarcastic_user_prompt("default chat history")
+        .expect("the default condensed prompt must render");
+
+    assert!(rendered.contains("default chat history"));
+    assert!(!rendered.contains("{{"));
+}
+
+#[test]
+fn condensed_template_render_errors_are_returned_to_the_caller() {
+    let mut values = required_values();
+    values.push((
+        "SARCASTIC_CONDENSED_USER_PROMPT",
+        "{{ .ChatHistory.Missing }}",
+    ));
+
+    let cfg = config(&values).expect("the parser accepts the nested-field template");
+    let err = cfg
+        .condensed_prompts
+        .render_user("a rendered chat history")
+        .expect_err("rendering an unknown nested field must return an error");
+
+    assert_eq!(
+        err.to_string(),
+        "SARCASTIC_CONDENSED_USER_PROMPT is invalid"
+    );
+}
+
+#[test]
+fn structured_prompt_renders_language_and_chat_history_with_the_shared_engine() {
+    let rendered = render_structured_summary_user_prompt("Traditional Chinese", "chat payload")
+        .expect("the built-in structured prompt must render");
+
+    assert!(rendered.contains("Traditional Chinese"));
+    assert!(rendered.contains("chat payload"));
+    assert!(!rendered.contains("{{"));
+}
+
+#[test]
+fn config_trims_primary_models_before_normalizing_backups() {
+    let mut values = required_values();
+    values.extend([
+        ("OPENAI_API_MODEL_NAME", " detailed-primary "),
+        (
+            "OPENAI_API_MODEL_NAME_backup",
+            " detailed-primary , backup-a, backup-a ",
+        ),
+        ("SARCASTIC_CONDENSED_MODEL_NAME", " condensed-primary "),
+        (
+            "SARCASTIC_CONDENSED_MODEL_NAME_backup",
+            " condensed-primary , condensed-backup, condensed-backup ",
+        ),
+        ("CHECK_MODEL", " check-primary "),
+        (
+            "CHECK_MODEL_backup",
+            " check-primary , check-backup, check-backup ",
+        ),
+    ]);
+
+    let cfg = config(&values).expect("configuration should load");
+
+    assert_eq!(cfg.recap_openai.primary_model, "detailed-primary");
+    assert_eq!(cfg.recap_openai.primary_backups, ["backup-a"]);
+    assert_eq!(cfg.recap_openai.condensed_model, "condensed-primary");
+    assert_eq!(cfg.recap_openai.condensed_backups, ["condensed-backup"]);
+    assert_eq!(
+        cfg.recap_openai.check_model.as_deref(),
+        Some("check-primary")
+    );
+    assert_eq!(cfg.recap_openai.check_backups, ["check-backup"]);
 }
 
 #[test]

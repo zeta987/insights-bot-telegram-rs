@@ -31,7 +31,11 @@ async fn run() -> Result<()> {
 
     let database = db::Database::connect_from_env(&config.db).await?;
     let i18n = i18n::I18n::load_from_dir(&config.locales_dir)?;
-    let openai = services::openai::OpenAiClient::new(&config.openai)?;
+    let openai = services::openai::OpenAiClient::new(
+        &config.openai,
+        &config.recap_openai,
+        &config.condensed_prompts,
+    )?;
     // Allow 3 recap requests per minute per chat/user
     let limiter =
         services::rate_limit::CommandRateLimiter::new(3, std::time::Duration::from_secs(60));

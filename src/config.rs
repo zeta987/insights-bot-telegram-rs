@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::HashMap, env};
 
 use anyhow::{Context, Result, bail};
 use teloxide::Bot;
@@ -47,8 +47,12 @@ pub struct TelegramConfig {
 }
 
 impl TelegramConfig {
+    pub fn api_base(&self) -> &str {
+        &self.api_endpoint
+    }
+
     pub fn bot(&self) -> Bot {
-        let api_url = Url::parse(&self.api_endpoint)
+        let api_url = Url::parse(self.api_base())
             .expect("Telegram API endpoint was validated during configuration loading");
         Bot::new(&self.bot_token).set_api_url(api_url)
     }
@@ -101,6 +105,16 @@ pub struct RecapOpenAiConfig {
 pub struct CondensedPromptConfig {
     pub system_prompt: Option<String>,
     pub user_prompt: Option<String>,
+}
+
+impl CondensedPromptConfig {
+    pub fn render_user(&self, chat_history: &str) -> Result<String> {
+        let template = self
+            .user_prompt
+            .as_deref()
+            .context("SARCASTIC_CONDENSED_USER_PROMPT is not configured")?;
+        render_go_template(template, [("ChatHistory", chat_history)])
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,19 +193,19 @@ impl AppConfig {
             bail!("OPENAI_API_SECRET is required");
         }
 
-        let primary_model = optional_non_empty(&lookup, "OPENAI_API_MODEL_NAME")
+        let primary_model = trimmed_non_empty(&lookup, "OPENAI_API_MODEL_NAME")
             .unwrap_or_else(|| "gpt-3.5-turbo".to_owned());
         let primary_backups = normalized_backups(
             optional_non_empty(&lookup, "OPENAI_API_MODEL_NAME_backup"),
             &primary_model,
         );
-        let condensed_model = optional_non_empty(&lookup, "SARCASTIC_CONDENSED_MODEL_NAME")
+        let condensed_model = trimmed_non_empty(&lookup, "SARCASTIC_CONDENSED_MODEL_NAME")
             .unwrap_or_else(|| primary_model.clone());
         let condensed_backups = normalized_backups(
             optional_non_empty(&lookup, "SARCASTIC_CONDENSED_MODEL_NAME_backup"),
             &condensed_model,
         );
-        let check_model = optional_non_empty(&lookup, "CHECK_MODEL");
+        let check_model = trimmed_non_empty(&lookup, "CHECK_MODEL");
         let check_backups = check_model.as_ref().map_or_else(Vec::new, |primary| {
             normalized_backups(optional_non_empty(&lookup, "CHECK_MODEL_backup"), primary)
         });
@@ -226,7 +240,7 @@ impl AppConfig {
         };
         let user_prompt = optional_non_empty(&lookup, "SARCASTIC_CONDENSED_USER_PROMPT");
         if let Some(template) = user_prompt.as_deref() {
-            validate_go_template(template)?;
+            parse_go_template(template)?;
         }
         let condensed_prompts = CondensedPromptConfig {
             system_prompt: optional_non_empty(&lookup, "SARCASTIC_CONDENSED_SYSTEM_PROMPT"),
@@ -282,6 +296,16 @@ where
     F: Fn(&str) -> Option<String>,
 {
     lookup(key).filter(|value| !value.trim().is_empty())
+}
+
+fn trimmed_non_empty<F>(lookup: &F, key: &str) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(key).and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 fn bool_switch<F>(lookup: &F, key: &str) -> bool
@@ -366,35 +390,25 @@ fn openai_api_base(value: Option<String>) -> Option<String> {
     })
 }
 
-fn validate_go_template(template: &str) -> Result<()> {
-    let mut remainder = template;
-    let mut controls = Vec::new();
-    while let Some(open) = remainder.find("{{") {
-        remainder = &remainder[open + 2..];
-        let Some(close) = remainder.find("}}") else {
-            bail!("SARCASTIC_CONDENSED_USER_PROMPT contains an unclosed template action");
-        };
-        let action = remainder[..close].trim();
-        if action.is_empty() {
-            bail!("SARCASTIC_CONDENSED_USER_PROMPT contains an empty template action");
-        }
-        match action.split_whitespace().next() {
-            Some("if" | "range" | "with" | "define" | "block") => controls.push(action),
-            Some("end") if controls.pop().is_none() => {
-                bail!("SARCASTIC_CONDENSED_USER_PROMPT contains an unexpected template end")
-            }
-            Some("else") if controls.is_empty() => {
-                bail!("SARCASTIC_CONDENSED_USER_PROMPT contains an unexpected template else")
-            }
-            _ => {}
-        }
-        remainder = &remainder[close + 2..];
-    }
-    if remainder.contains("}}") {
-        bail!("SARCASTIC_CONDENSED_USER_PROMPT contains an unexpected template close")
-    }
-    if !controls.is_empty() {
-        bail!("SARCASTIC_CONDENSED_USER_PROMPT contains an unclosed template control")
-    }
-    Ok(())
+fn parse_go_template(source: &str) -> Result<gtmpl::Template> {
+    let mut template = gtmpl::Template::default();
+    template
+        .parse(source)
+        .map_err(|_| anyhow::anyhow!("SARCASTIC_CONDENSED_USER_PROMPT is invalid"))?;
+    Ok(template)
+}
+
+pub(crate) fn render_go_template<'a>(
+    source: &str,
+    values: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<String> {
+    let template = parse_go_template(source)?;
+    let context = HashMap::from_iter(
+        values
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned())),
+    );
+    template
+        .render(&gtmpl::Context::from(context))
+        .map_err(|_| anyhow::anyhow!("SARCASTIC_CONDENSED_USER_PROMPT is invalid"))
 }

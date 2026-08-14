@@ -25,8 +25,9 @@ teloxide 與 Rich Message transport 共用。
 `AUTO_RECAP_TEST_ENABLED` 並提供非零 `AUTO_RECAP_TEST_CHAT_ID` 時，啟動會保留
 一般排程，另外佇列一次立即自動 recap。
 
-`SARCASTIC_CONDENSED_USER_PROMPT` 在啟動時以 Go 相容 `{{ .ChatHistory }}`
-template 格式驗證；格式錯誤會在 OpenAI 請求前回傳設定錯誤。
+`SARCASTIC_CONDENSED_USER_PROMPT` 在啟動時以 recap 使用的 Go-template
+語法驗證，支援 `{{ .ChatHistory }}`、`printf` 與 comments；格式錯誤會在
+OpenAI 請求前回傳設定錯誤。
 
 ## 驗證
 

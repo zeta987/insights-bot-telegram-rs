@@ -51,8 +51,9 @@ recap interval is in seconds and invalid or negative values become `0`.
 `TELEGRAM_BOT_API_ENDPOINT` defaults to `https://api.telegram.org`; a custom
 endpoint must be an absolute HTTP(S) base URL and trailing slashes are removed.
 The same base is used for ordinary teloxide calls and Rich Message transport.
-`SARCASTIC_CONDENSED_USER_PROMPT` is validated as a Go-compatible template at
-startup. `AUTO_RECAP_TEST_ENABLED=true` or `1` with a nonzero
+`SARCASTIC_CONDENSED_USER_PROMPT` is validated at startup with the supported
+Go-template syntax used by recap, including `{{ .ChatHistory }}`, `printf`,
+and comments. `AUTO_RECAP_TEST_ENABLED=true` or `1` with a nonzero
 `AUTO_RECAP_TEST_CHAT_ID` schedules one immediate automatic recap in addition
 to the normal schedule.
 
