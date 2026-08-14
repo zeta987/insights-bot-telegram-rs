@@ -7,6 +7,36 @@ stable identifier is retained when its owning module changes.  `/smr` generation
 is deliberately absent; `smr/summarization/feedback/react` appears only as the
 required recap-button compatibility callback.
 
+## Approved plan verification map
+
+Every `Rust test` cell is a direct key into this approved-plan map; this makes
+each ledger row verifiable against the named Task 2–14 section without adding a
+tenth ledger column.
+
+| Rust test cell | Approved plan reference |
+| --- | --- |
+| `config_tests` | Task 2 — Add exact configuration parsing and dependencies |
+| `recap_redis_state_tests` | Task 3 — Implement Redis recap state and callback codecs |
+| `recap_persistence_tests` | Task 4 — Add recap-domain SQL migrations and repositories |
+| `recap_scope_tests` | Task 4 — Add recap-domain SQL migrations and repositories; Task 11 — Port callback router, manual recap, and configuration |
+| `rich_recap_content_tests` | Task 5 — Port prompt rows, sanitizers, references, and model trace |
+| `rich_recap_composition_tests` | Task 6 — Port Rich composition and plain conversion |
+| `telegram_rich_tests` | Task 7 — Add raw Telegram Rich Message transport |
+| `recap_delivery_tests` | Task 8 — Implement recap delivery and fallback state machine |
+| `openai_rich_recap_tests` | Task 9 — Port OpenAI recap generation, traces, logs, and metrics |
+| `recap_generation_tests` | Task 9 — Port OpenAI recap generation, traces, logs, and metrics |
+| `message_capture_tests` | Task 10 — Port message capture, edit, migration, and bot-left behavior |
+| `chat_lifecycle_tests` | Task 10 — Port message capture, edit, migration, and bot-left behavior |
+| `recap_callback_tests` | Task 11 — Port callback router, manual recap, and configuration |
+| `recap_manual_tests` | Task 11 — Port callback router, manual recap, and configuration |
+| `recap_config_handler_tests` | Task 11 — Port callback router, manual recap, and configuration |
+| `recap_subscription_tests` | Task 12 — Port subscriptions and feedback compatibility |
+| `recap_feedback_tests` | Task 12 — Port subscriptions and feedback compatibility |
+| `recap_forwarded_tests` | Task 13 — Port forwarded recap sessions |
+| `autorecap_queue_tests` | Task 14 — Port automatic queue, fan-out, and pinning |
+| `autorecap_worker_tests` | Task 14 — Port automatic queue, fan-out, and pinning |
+| `autorecap_delivery_tests` | Task 14 — Port automatic queue, fan-out, and pinning |
+
 | Go file and line | Go function or branch | Trigger and callback literal | Telegram effect | SQL effect | Redis effect | Rust symbol | Rust test | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `command_common.go:194` | `MANUAL-001 handleRecapCommand`: reject non-group chat | `/recap` | group-only error reply | none | none | `recap_manual::handle_recap` | `recap_manual_tests` | not-started |
@@ -35,8 +65,8 @@ required recap-button compatibility callback.
 | `middleware.go:39` | `CAPTURE-001 message capture before dispatch` | message update | no direct reply | save enabled group/supergroup history; private only with active forwarded control | refresh forwarded control/batch TTL after accepted private text or caption | `middleware::capture_message_before_dispatch` | `message_capture_tests` | not-started |
 | `middleware.go:39` | `CAPTURE-002 caption/reply/entity preprocessing` | captured message | no direct reply | save caption-first text, reply snapshot, millisecond timestamp and forwarding prefix | none | `message_extract::extract_history` | `message_capture_tests` | not-started |
 | `middleware.go:39` | `CAPTURE-003 message edit branch` | edited-message update | no direct reply | update only text by `(chat_id,message_id)` and preserve other history fields | none | `middleware::capture_edited_message` | `message_capture_tests` | not-started |
-| `migration.go:20` | `CAPTURE-003 group migration update` | migration update | no reply | migrate flags/options/subscribers/histories/log chat ID; force history type supergroup | none | `migration::migrate_recap_chat` | `chat_lifecycle_tests` | not-started |
-| `chat_member.go:20` | `CAPTURE-004 bot-left update` | bot removed from group | no reply | delete subscribers/flags/options/histories; blank recap-log input/output; retain logs and other domain rows | none | `chat_member::handle_bot_left` | `chat_lifecycle_tests` | not-started |
+| `migration.go:20` | `CAPTURE-004 group migration update` | migration update | no reply | migrate flags/options/subscribers/histories/log chat ID; force history type supergroup | none | `migration::migrate_recap_chat` | `chat_lifecycle_tests` | not-started |
+| `chat_member.go:20` | `CAPTURE-005 bot-left update` | bot removed from group | no reply | delete subscribers/flags/options/histories; blank recap-log input/output; retain logs and other domain rows | none | `chat_member::handle_bot_left` | `chat_lifecycle_tests` | not-started |
 | `callback_query.go:49` | `CALLBACK-008 callback wire dispatcher` | `<route-hash>;<action-hash>` | malformed/known-missing route generic edit; unknown route silent; expired payload reaches handler bind branch | none | `callback_query/button_data/<literal-route>/<action-hash>` JSON, 86,400-second TTL | `callbacks::dispatch` | `recap_callback_tests`, `recap_redis_state_tests` | not-started |
 | `feedback_callback_query.go:12` | `CALLBACK-009 handleCallbackQueryReact` | `recap/recap/feedback/react` | recap vote keyboard edit | toggle/replace recap reaction and recount duplicates | read callback action | `recap_feedback::handle_recap_reaction` | `recap_callback_tests`, `recap_feedback_tests` | not-started |
 | `summarize/feedback_callback_query.go:12` | `FEEDBACK-001 recap-button compatibility action` | `smr/summarization/feedback/react` | edits source-group message even after subscriber DM click | toggle/replace summarization reaction and recount duplicates | read callback action | `recap_feedback::handle_smr_compat_reaction` | `recap_callback_tests`, `recap_feedback_tests` | not-started |
@@ -85,5 +115,16 @@ required recap-button compatibility callback.
 | `autorecap.go:177` | `SQL-016 automatic sent-message branch` | automatic Rich result or partial failure | no direct reply | one-row-at-a-time automatic-only sent-message insert; last-pin lookup and bulk clear by selected pair | none | `sent_messages::{insert_all,last_pinned,clear_selected_pin}` | `recap_persistence_tests`, `autorecap_delivery_tests` | not-started |
 | `migration.go:20` | `SQL-017 migration subset branch` | group-to-supergroup update | no direct reply | migrate feature/options/subscribers/histories/logs only; leave chats/sent/reactions/metrics | none | `migration::migrate_recap_chat` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
 | `chat_member.go:20` | `SQL-018 bot-left cleanup subset branch` | bot-left update | no direct reply | delete flags/options/subscribers/histories; blank logs; retain sent/reactions/metrics | none | `chat_member::handle_bot_left` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
+| `feature_flags.go:112` | `SQL-019 EnableChatHistoriesRecapForGroups` | configuration enable | configuration keyboard continues | create or update group feature flag to enabled | none | `feature_flags::enable_recap_for_group` | `recap_persistence_tests`, `recap_config_handler_tests` | not-started |
+| `feature_flags.go:142` | `SQL-020 DisableChatHistoriesRecapForGroups` | configuration disable | configuration keyboard continues | create disabled flag when absent or update existing enabled flag to disabled | none | `feature_flags::disable_recap_for_group` | `recap_persistence_tests`, `recap_config_handler_tests` | not-started |
+| `feature_flags.go:186` | `SQL-021 HasChatHistoriesRecapEnabledForGroups` | capture, manual recap, or scheduler read | caller applies enabled or disabled response | query recap feature flag; absent row is disabled | none | `feature_flags::is_recap_enabled_for_group` | `recap_persistence_tests`, `recap_scope_tests` | not-started |
+| `feature_flags.go:207` | `SQL-022 ListChatHistoriesRecapEnabledChatsForGroups` | automatic scheduling read | no direct reply | query enabled group and supergroup feature rows | none | `feature_flags::list_enabled_recap_groups` | `recap_persistence_tests`, `autorecap_worker_tests` | not-started |
+| `feature_flags.go:348` | `SQL-023 DeleteOneFeatureFlagByChatID` | bot-left cleanup | no direct reply | delete one group feature-flag row | none | `feature_flags::delete_for_chat` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
+| `feature_flags.go:360` | `SQL-024 MigrateFeatureFlagsOfChatFromChatIDToChatID` | group-to-supergroup migration | no direct reply | migrate feature-flag chat ID | none | `feature_flags::migrate_chat_id` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
+| `chat_histories.go:215` | `SQL-025 SaveOneTelegramChatHistory` | accepted captured message | no direct reply | insert message, chat metadata, reply snapshot, forwarding prefix, and millisecond timestamp | none | `chat_history::insert_message` | `recap_persistence_tests`, `message_capture_tests` | not-started |
+| `chat_histories.go:264` | `SQL-026 UpdateOneTelegramChatHistory` | edited message | no direct reply | update only text by `(chat_id,message_id)` | none | `chat_history::update_message_text` | `recap_persistence_tests`, `message_capture_tests` | not-started |
+| `chat_histories.go:303` | `SQL-027 DeleteAllChatHistoriesByChatID` | bot-left cleanup | no direct reply | delete all histories for chat | none | `chat_history::delete_all_for_chat` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
+| `chat_histories.go:315` | `SQL-028 MigrateChatHistoriesOfChatFromChatIDToChatID` | group-to-supergroup migration | no direct reply | migrate history chat ID and force supergroup type | none | `chat_history::migrate_chat_id` | `recap_persistence_tests`, `chat_lifecycle_tests` | not-started |
+| `chat_histories.go:351` | `SQL-029 FindChatHistoriesByTimeBefore` | manual/automatic recap window | caller enforces history threshold | strict cutoff query sorted by ascending message ID | none | `chat_history::recent_messages_after_cutoff` | `recap_persistence_tests`, `message_capture_tests`, `autorecap_worker_tests` | not-started |
 | `openai.go:89` | `CONFIG-002 NewClient configuration branch` | application startup | shared configured Telegram/OpenAI behavior | none | none | `config::AppConfig::from_lookup` | `config_tests` | not-started |
 | `rich_message.go:45` | `CONFIG-003 custom Telegram endpoint branch` | application startup | ordinary and Rich Bot API share normalized base endpoint | none | none | `config::AppConfig::from_lookup`, `telegram_rich::TelegramRichClient` | `config_tests`, `telegram_rich_tests` | not-started |
