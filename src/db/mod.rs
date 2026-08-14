@@ -5,6 +5,7 @@ use url::Url;
 
 use crate::config::DbConfig;
 
+pub mod chat_cleanup;
 pub mod chat_history;
 pub mod codec;
 pub mod feature_flags;

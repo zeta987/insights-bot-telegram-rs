@@ -58,6 +58,68 @@ pub struct ChatHistory {
     pub created_at: i64,
 }
 
+/// One row of `chat_histories`, in the shape Go v1.0.0 persists and reads.
+///
+/// The Rust table is the same physical table the legacy [`ChatHistory`] reader
+/// uses; the Rich recap parity migration only added Go's columns to it. This
+/// model exposes exactly Go's column set, so the Rust-only columns (`kind`,
+/// `from_id`, `from_full_name`, `from_username`, `media_url`) are absent here.
+///
+/// Rows are physical: the table carries no uniqueness over
+/// `(chat_id, message_id)`, so two rows may hold the same pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelegramChatHistory {
+    pub id: i64,
+    pub chat_id: i64,
+    pub chat_type: String,
+    pub chat_title: String,
+    pub message_id: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub full_name: String,
+    pub text: String,
+    pub replied_to_message_id: i64,
+    pub replied_to_user_id: i64,
+    pub replied_to_full_name: String,
+    pub replied_to_username: String,
+    pub replied_to_text: String,
+    pub replied_to_chat_type: String,
+    /// Unix milliseconds, taken from the Telegram message date.
+    pub chatted_at: i64,
+    pub embedded: bool,
+    pub from_platform: i64,
+    /// Unix milliseconds.
+    pub created_at: i64,
+    /// Unix milliseconds.
+    pub updated_at: i64,
+}
+
+/// What a caller supplies when persisting one chat history row.
+///
+/// `id`, `created_at`, `updated_at`, `embedded`, and `from_platform` are absent
+/// because Go's create fixes every one of them, so the repository does too.
+/// The forwarding prefix Go builds with `[forwarded from ..]` is part of `text`
+/// by the time it reaches the repository, exactly as in Go.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTelegramChatHistory {
+    pub chat_id: i64,
+    pub chat_type: String,
+    pub chat_title: String,
+    pub message_id: i64,
+    pub user_id: i64,
+    pub username: String,
+    pub full_name: String,
+    pub text: String,
+    pub replied_to_message_id: i64,
+    pub replied_to_user_id: i64,
+    pub replied_to_full_name: String,
+    pub replied_to_username: String,
+    pub replied_to_text: String,
+    pub replied_to_chat_type: String,
+    /// Unix milliseconds, taken from the Telegram message date.
+    pub chatted_at: i64,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct RecapConfig {
     pub chat_id: i64,

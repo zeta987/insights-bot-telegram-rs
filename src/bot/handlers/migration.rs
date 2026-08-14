@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use teloxide::prelude::*;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::bot::context::AppContext;
 
@@ -27,24 +27,10 @@ impl MigrationHandlers {
             "received chat migration event"
         );
 
-        match crate::db::migration::migrate_chat_data(&ctx.db.pool, old_chat_id, new_chat_id).await
-        {
-            Ok(()) => {
-                info!(
-                    old_chat_id = old_chat_id,
-                    new_chat_id = new_chat_id,
-                    "chat data migration successful"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    old_chat_id = old_chat_id,
-                    new_chat_id = new_chat_id,
-                    error = %err,
-                    "chat data migration failed"
-                );
-            }
-        }
+        // Go's parity set, and only that set. Each step logs its own failure and
+        // none blocks the next, so there is no aggregate outcome to branch on.
+        // `recap_configs` has no Go counterpart and is deliberately untouched.
+        crate::db::migration::migrate_chat_data(&ctx.db, old_chat_id, new_chat_id).await;
 
         Ok(())
     }

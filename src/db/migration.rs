@@ -1,75 +1,83 @@
+//! Group to supergroup migration.
+//!
+//! Ported from Go v1.0.0
+//! `internal/bots/telegram/handlers/chatmigrate/chatmigrate.go`, which runs five
+//! independent steps in a fixed order with no transaction around them and no
+//! early exit: `fo.May0` logs a failing step and the next one still runs.
+//!
+//! The set of tables is Go's, and so is the set it leaves alone. `telegram_chats`
+//! (this schema's `chats`), `sent_messages`, both feedback reaction tables, the
+//! token-usage metric table, and every Redis key are untouched, because Go never
+//! rewrites them on an upgrade.
+
 use anyhow::Result;
-use sqlx::AnyPool;
-use tracing::info;
+use tracing::{error, info};
 
-/// Migrate all data from old_chat_id to new_chat_id in a single transaction.
-/// Used when Telegram upgrades a group to a supergroup.
-pub async fn migrate_chat_data(pool: &AnyPool, old_chat_id: i64, new_chat_id: i64) -> Result<()> {
-    let mut tx = pool.begin().await?;
+use crate::db::{Database, chat_history, feature_flags, recap_logs, recap_options, subscribers};
 
-    // Update chat_histories
-    sqlx::query("UPDATE chat_histories SET chat_id = $1 WHERE chat_id = $2")
-        .bind(new_chat_id)
-        .bind(old_chat_id)
-        .execute(&mut *tx)
-        .await?;
-
-    // Migrate recap_configs: check for conflict first
-    let existing: Option<(i64,)> = sqlx::query_as(
-        "SELECT chat_id FROM recap_configs WHERE chat_id = $1 LIMIT 1",
-    )
-    .bind(new_chat_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if existing.is_none() {
-        // No conflict, safe to update
-        sqlx::query("UPDATE recap_configs SET chat_id = $1, updated_at = $2 WHERE chat_id = $3")
-            .bind(new_chat_id)
-            .bind(chrono::Utc::now().timestamp())
-            .bind(old_chat_id)
-            .execute(&mut *tx)
-            .await?;
-    } else {
-        // Conflict: delete old config (new one takes precedence)
-        sqlx::query("DELETE FROM recap_configs WHERE chat_id = $1")
-            .bind(old_chat_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-
-    // Migrate chats table: check if new exists, copy old to new, then delete old.
-    let existing_chat: Option<(i64,)> = sqlx::query_as(
-        "SELECT id FROM chats WHERE id = $1 LIMIT 1",
-    )
-    .bind(new_chat_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if existing_chat.is_none() {
-        sqlx::query(
-            "INSERT INTO chats (id, title, username, kind, created_at, updated_at)
-             SELECT $1, title, username, kind, created_at, $2
-             FROM chats WHERE id = $3",
-        )
-        .bind(new_chat_id)
-        .bind(chrono::Utc::now().timestamp())
-        .bind(old_chat_id)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    sqlx::query("DELETE FROM chats WHERE id = $1")
-        .bind(old_chat_id)
-        .execute(&mut *tx)
-        .await?;
-
-    tx.commit().await?;
+/// Move every Go-parity row of `from_chat_id` onto `to_chat_id`.
+///
+/// Every step is attempted even after an earlier one failed and nothing is
+/// reported back, which is exactly what `fo.May0` does: it logs and continues,
+/// and the handler has no failure to react to. Returning `()` keeps a caller
+/// from inventing a recovery path Go does not have.
+///
+/// `recap_configs` is deliberately absent. It has no Go counterpart, so the
+/// parity orchestrator must not touch it.
+pub async fn migrate_chat_data(db: &Database, from_chat_id: i64, to_chat_id: i64) {
+    record(
+        "feature flags",
+        from_chat_id,
+        to_chat_id,
+        feature_flags::migrate_chat_id(db, from_chat_id, to_chat_id).await,
+    );
+    record(
+        "recap options",
+        from_chat_id,
+        to_chat_id,
+        recap_options::migrate_chat_id(db, from_chat_id, to_chat_id).await,
+    );
+    record(
+        "subscribers",
+        from_chat_id,
+        to_chat_id,
+        subscribers::migrate_chat_id(db, from_chat_id, to_chat_id).await,
+    );
+    record(
+        "chat histories",
+        from_chat_id,
+        to_chat_id,
+        chat_history::migrate_chat_id(db, from_chat_id, to_chat_id).await,
+    );
+    record(
+        "recap logs",
+        from_chat_id,
+        to_chat_id,
+        recap_logs::migrate_chat_id(db, from_chat_id, to_chat_id).await,
+    );
 
     info!(
-        old_chat_id = old_chat_id,
-        new_chat_id = new_chat_id,
-        "chat migration completed"
+        from_chat_id = from_chat_id,
+        to_chat_id = to_chat_id,
+        "finished migrating the chat data sets to the supergroup"
     );
-    Ok(())
+}
+
+/// Log one completed step, whether or not it succeeded.
+fn record(step: &'static str, from_chat_id: i64, to_chat_id: i64, outcome: Result<()>) {
+    match outcome {
+        Ok(()) => info!(
+            step = step,
+            from_chat_id = from_chat_id,
+            to_chat_id = to_chat_id,
+            "migrated one chat data set"
+        ),
+        Err(error) => error!(
+            step = step,
+            from_chat_id = from_chat_id,
+            to_chat_id = to_chat_id,
+            error = ?error,
+            "failed to migrate one chat data set"
+        ),
+    }
 }

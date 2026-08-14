@@ -1,6 +1,9 @@
 use insights_bot_telegram_rs::{
     bot::commands::Command,
-    db::{chat_history, migration, models::RecapConfig, models::MessageKind, recap_config},
+    db::{
+        Database, DbBackend, chat_history, migration, models::MessageKind, models::RecapConfig,
+        recap_config,
+    },
 };
 use sqlx::{AnyPool, any::AnyPoolOptions};
 use teloxide::utils::command::BotCommands;
@@ -13,10 +16,12 @@ async fn setup_sqlite_pool() -> AnyPool {
         .await
         .expect("sqlite memory pool");
 
-    // Run both migrations
+    // Run every migration: the parity tables the chat migration touches are
+    // created by 0003.
     let migrations = [
         include_str!("../migrations/sqlite/0001_init.sql"),
         include_str!("../migrations/sqlite/0002_recap_config_extensions.sql"),
+        include_str!("../migrations/sqlite/0003_rich_recap_parity.sql"),
     ];
 
     for migration_sql in migrations {
@@ -235,9 +240,15 @@ async fn default_config_has_expected_values() {
         .await
         .expect("get_or_create should succeed");
 
-    assert_eq!(cfg.auto_recap_rates_per_day, 4, "default frequency should be 4x/day");
+    assert_eq!(
+        cfg.auto_recap_rates_per_day, 4,
+        "default frequency should be 4x/day"
+    );
     assert!(!cfg.pin_auto_recap_message, "pin should default to false");
-    assert_eq!(cfg.last_pinned_message_id, None, "no pinned message initially");
+    assert_eq!(
+        cfg.last_pinned_message_id, None,
+        "no pinned message initially"
+    );
 }
 
 // -- Tests for update_message_text (Task 9.2) --
@@ -246,9 +257,20 @@ async fn default_config_has_expected_values() {
 async fn update_message_text_updates_existing_message() {
     let pool = setup_sqlite_pool().await;
 
-    chat_history::insert_message(&pool, 10, 100, Some(1), Some("Alice".into()), Some("alice".into()), MessageKind::Text, Some("original text".into()), None, 1000)
-        .await
-        .expect("insert should succeed");
+    chat_history::insert_message(
+        &pool,
+        10,
+        100,
+        Some(1),
+        Some("Alice".into()),
+        Some("alice".into()),
+        MessageKind::Text,
+        Some("original text".into()),
+        None,
+        1000,
+    )
+    .await
+    .expect("insert should succeed");
 
     chat_history::update_message_text(&pool, 10, 100, "edited text")
         .await
@@ -273,76 +295,92 @@ async fn update_message_text_noop_on_missing_message() {
 
 // -- Tests for migrate_chat_data (Task 9.3) --
 
-#[tokio::test]
-async fn migrate_chat_data_moves_histories_and_config() {
-    let pool = setup_sqlite_pool().await;
-
-    // Insert chat history and config for old chat_id
-    chat_history::insert_message(&pool, 50, 1, Some(1), Some("Bob".into()), None, MessageKind::Text, Some("hello".into()), None, 2000)
-        .await
-        .expect("insert msg");
-    recap_config::upsert_recap_config(&pool, &RecapConfig {
-        auto_recap_enabled: true,
-        ..default_config(50)
-    }).await.expect("insert config");
-
-    // Migrate from 50 to 500
-    migration::migrate_chat_data(&pool, 50, 500)
-        .await
-        .expect("migration should succeed");
-
-    // Old chat_id should have no messages
-    let old_msgs = chat_history::recent_messages(&pool, 50, 10).await.expect("fetch old");
-    assert!(old_msgs.is_empty(), "old chat should have no messages after migration");
-
-    // New chat_id should have the message
-    let new_msgs = chat_history::recent_messages(&pool, 500, 10).await.expect("fetch new");
-    assert_eq!(new_msgs.len(), 1);
-    assert_eq!(new_msgs[0].text, "hello");
-
-    // Config should be under new chat_id
-    let old_cfg = recap_config::get_recap_config(&pool, 50).await.expect("fetch old cfg");
-    assert!(old_cfg.is_none(), "old config should be gone");
-
-    let new_cfg = recap_config::get_recap_config(&pool, 500).await.expect("fetch new cfg");
-    assert!(new_cfg.is_some(), "new config should exist");
-    assert!(new_cfg.unwrap().auto_recap_enabled);
+/// The application handle around a fixture pool.
+///
+/// `migrate_chat_data` reaches several parity repositories, which branch on the
+/// backend, so they need the handle rather than the bare pool.
+fn database(pool: &AnyPool) -> Database {
+    Database {
+        pool: pool.clone(),
+        backend: DbBackend::Sqlite,
+    }
 }
 
 #[tokio::test]
-async fn migrate_chat_data_handles_conflict_gracefully() {
+async fn migrate_chat_data_moves_histories() {
     let pool = setup_sqlite_pool().await;
+    let db = database(&pool);
 
-    // Both old and new already have configs
-    recap_config::upsert_recap_config(&pool, &RecapConfig {
-        auto_recap_rates_per_day: 2,
-        ..default_config(60)
-    }).await.expect("insert old config");
-    recap_config::upsert_recap_config(&pool, &RecapConfig {
-        auto_recap_rates_per_day: 3,
-        ..default_config(600)
-    }).await.expect("insert new config");
+    chat_history::insert_message(
+        &pool,
+        50,
+        1,
+        Some(1),
+        Some("Contributor".into()),
+        None,
+        MessageKind::Text,
+        Some("hello".into()),
+        None,
+        2000,
+    )
+    .await
+    .expect("insert msg");
 
-    // Migration should succeed without PK conflict
-    migration::migrate_chat_data(&pool, 60, 600)
+    migration::migrate_chat_data(&db, 50, 500).await;
+
+    let old_msgs = chat_history::recent_messages(&pool, 50, 10)
         .await
-        .expect("migration with conflict should succeed");
+        .expect("fetch old");
+    assert!(
+        old_msgs.is_empty(),
+        "old chat should have no messages after migration"
+    );
 
-    // New config should still exist (either the old or new, depending on impl)
-    let cfg = recap_config::get_recap_config(&pool, 600)
+    let new_msgs = chat_history::recent_messages(&pool, 500, 10)
         .await
-        .expect("fetch")
-        .expect("config should exist");
-    // New config takes precedence (3), old is deleted
-    assert_eq!(cfg.auto_recap_rates_per_day, 3);
+        .expect("fetch new");
+    assert_eq!(new_msgs.len(), 1);
+    assert_eq!(new_msgs[0].text, "hello");
+}
+
+#[tokio::test]
+async fn migrate_chat_data_leaves_the_rust_only_recap_config_alone() {
+    let pool = setup_sqlite_pool().await;
+    let db = database(&pool);
+
+    recap_config::upsert_recap_config(
+        &pool,
+        &RecapConfig {
+            auto_recap_enabled: true,
+            ..default_config(50)
+        },
+    )
+    .await
+    .expect("insert config");
+
+    migration::migrate_chat_data(&db, 50, 500).await;
+
+    // `recap_configs` has no Go counterpart, so the parity orchestrator must
+    // not move, copy, or delete it.
+    let old_cfg = recap_config::get_recap_config(&pool, 50)
+        .await
+        .expect("fetch old cfg")
+        .expect("the original row stays where it was");
+    assert!(old_cfg.auto_recap_enabled);
+
+    assert!(
+        recap_config::get_recap_config(&pool, 500)
+            .await
+            .expect("fetch new cfg")
+            .is_none(),
+        "no row is created under the supergroup identifier"
+    );
 }
 
 #[tokio::test]
 async fn migrate_chat_data_noop_on_empty() {
     let pool = setup_sqlite_pool().await;
 
-    // No data for chat 999 — should succeed as no-op
-    migration::migrate_chat_data(&pool, 999, 9999)
-        .await
-        .expect("empty migration should succeed");
+    // No data for chat 999 — every step is a no-op and none reports a failure.
+    migration::migrate_chat_data(&database(&pool), 999, 9999).await;
 }
