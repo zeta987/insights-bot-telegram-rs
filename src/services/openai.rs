@@ -14,9 +14,11 @@ use crate::{
     db::models::ChatHistory,
     i18n::I18n,
     services::prompts::{
-        CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT,
-        CHECK_CONDENSED_OUTPUT_USER_PROMPT, CHECK_SUMMARY_JSON_SYSTEM_PROMPT,
-        CHECK_SUMMARY_JSON_USER_PROMPT, PromptConfig, StructuredSummary, TopicSummary,
+        ANY_SUMMARIZATION_SYSTEM_PROMPT, CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
+        CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_USER_PROMPT,
+        CHECK_SUMMARY_JSON_SYSTEM_PROMPT, CHECK_SUMMARY_JSON_USER_PROMPT,
+        ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, PromptConfig, StructuredSummary,
+        TopicSummary, render_any_summarization_user_prompt, render_one_chat_history_user_prompt,
         render_structured_summary_user_prompt,
     },
 };
@@ -397,6 +399,65 @@ impl OpenAiClient {
             trace,
             created_at: chrono::Utc::now().timestamp(),
         })
+    }
+
+    /// Go's `openai.Client.SummarizeAny`.
+    ///
+    /// Returns every choice's content in order, so an empty vector carries Go's
+    /// `len(resp.Choices) == 0` to the caller instead of hiding it.
+    pub async fn summarize_any(&self, content: &str) -> Result<Vec<String>> {
+        self.summarize_with(
+            ANY_SUMMARIZATION_SYSTEM_PROMPT,
+            render_any_summarization_user_prompt(content),
+            "summarize any failed",
+        )
+        .await
+    }
+
+    /// Go's `openai.Client.SummarizeOneChatHistory`.
+    pub async fn summarize_one_chat_history(&self, chat_history: &str) -> Result<Vec<String>> {
+        self.summarize_with(
+            ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
+            render_one_chat_history_user_prompt(chat_history),
+            "summarize one chat history failed",
+        )
+        .await
+    }
+
+    /// The shared shape of Go's two preprocessing completions: primary model,
+    /// one system message, one user message, and no token ceiling.
+    async fn summarize_with(
+        &self,
+        system_prompt: &str,
+        user_prompt: String,
+        failure_context: &'static str,
+    ) -> Result<Vec<String>> {
+        let req = CreateChatCompletionRequestArgs::default()
+            .model(&self.model)
+            .messages(vec![
+                ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                    content: system_prompt.into(),
+                    name: None,
+                }),
+                ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                    content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
+                    name: None,
+                }),
+            ])
+            .build()?;
+
+        let resp = self
+            .client
+            .chat()
+            .create(req)
+            .await
+            .context(failure_context)?;
+
+        Ok(resp
+            .choices
+            .iter()
+            .map(|choice| choice.message.content.clone().unwrap_or_default())
+            .collect())
     }
 }
 

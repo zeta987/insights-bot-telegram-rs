@@ -56,6 +56,25 @@ Rules:
 
 pub const CHECK_CONDENSED_OUTPUT_USER_PROMPT: &str = "Please rewrite the following invalid condensed summary into one natural sentence:\n\n{{raw_output}}";
 
+// Message preprocessing prompts, ported verbatim from Go v1.0.0
+// `internal/thirdparty/openai/prompts.go` and `openai.go`.
+
+/// Go's `AnySummarizationSystemPrompt`, used when a link title exceeds 200 runes.
+pub const ANY_SUMMARIZATION_SYSTEM_PROMPT: &str = "你是我的总结助手。我将为你提供一段话，我需要你在不丢失原文主旨和情感、不做更多的解释和说明的情况下帮我用不超过100字总结一下这段话说了什么。";
+
+/// Go's `AnySummarizationUserPrompt`, whose template body is `內容：\n{{ .Content }}`.
+pub fn render_any_summarization_user_prompt(content: &str) -> String {
+    format!("內容：\n{content}")
+}
+
+/// Go's inline system prompt in `SummarizeOneChatHistory`.
+pub const ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT: &str = "你是我的聊天消息总结助手。我将为你提供一条包含了人物名称、人物用户名、消息发送时间、消息内容等信息的消息，因为这条聊天消息有些过长了，我需要你帮我总结一下这条消息说了什么。最好一句话概括，如果这条消息有标题的话你可以直接返回标题。";
+
+/// Go's inline user prompt in `SummarizeOneChatHistory`.
+pub fn render_one_chat_history_user_prompt(chat_history: &str) -> String {
+    format!("消息：\n{chat_history}\n请你帮我总结一下。")
+}
+
 /// Condensed prompts sourced from the validated application configuration.
 #[derive(Clone)]
 pub struct PromptConfig {

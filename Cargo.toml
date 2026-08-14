@@ -10,6 +10,7 @@ async-openai = { version = "0.28", default-features = false, features = ["rustls
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
+futures = "0.3"
 governor = { version = "0.6", features = ["dashmap"] }
 axum = { version = "0.7", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
@@ -47,4 +48,7 @@ tiktoken-rs = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` gives tests a paused clock, so the Go context deadlines can be
+# asserted without spending real seconds.
+tokio = { version = "1.40", features = ["test-util"] }
 wiremock = "0.6"

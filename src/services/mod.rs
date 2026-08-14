@@ -1,4 +1,5 @@
 pub mod autorecap;
+pub mod message_capture;
 pub mod openai;
 pub mod prompts;
 pub mod rate_limit;
