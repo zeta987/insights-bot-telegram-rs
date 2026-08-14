@@ -6,11 +6,15 @@ use insights_bot_telegram_rs::{
 };
 
 fn config(values: &[(&str, &str)]) -> anyhow::Result<AppConfig> {
-    let values = values
+    let values = env_map(values);
+    AppConfig::from_lookup(|key| values.get(key).cloned())
+}
+
+fn env_map(values: &[(&str, &str)]) -> BTreeMap<String, String> {
+    values
         .iter()
         .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-        .collect::<BTreeMap<_, _>>();
-    AppConfig::from_lookup(|key| values.get(key).cloned())
+        .collect()
 }
 
 fn required_values() -> Vec<(&'static str, &'static str)> {
@@ -294,26 +298,27 @@ fn condensed_template_render_errors_are_returned_to_the_caller() {
         "{{ .ChatHistory.Missing }}",
     ));
 
-    let cfg = config(&values).expect("the parser accepts the nested-field template");
-    let err = cfg
-        .condensed_prompts
-        .render_user("a rendered chat history")
-        .expect_err("rendering an unknown nested field must return an error");
+    let err = AppConfig::from_env_map(env_map(&values))
+        .err()
+        .expect("startup must reject a template that cannot render");
 
     assert_eq!(
         err.to_string(),
         "SARCASTIC_CONDENSED_USER_PROMPT is invalid"
     );
+    assert!(!err.to_string().contains("Missing"));
+    assert!(!err.to_string().contains("a rendered chat history"));
 }
 
 #[test]
 fn structured_prompt_renders_language_and_chat_history_with_the_shared_engine() {
-    let rendered = render_structured_summary_user_prompt("Traditional Chinese", "chat payload")
+    let history = "user typed {{ .Secret }} here";
+    let rendered = render_structured_summary_user_prompt("Traditional Chinese", history)
         .expect("the built-in structured prompt must render");
 
     assert!(rendered.contains("Traditional Chinese"));
-    assert!(rendered.contains("chat payload"));
-    assert!(!rendered.contains("{{"));
+    assert!(rendered.contains(history));
+    assert!(rendered.contains("{{ .Secret }}"));
 }
 
 #[test]

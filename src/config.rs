@@ -145,6 +145,11 @@ impl AppConfig {
         Self::from_lookup(|key| env::var(key).ok())
     }
 
+    pub fn from_env_map(values: impl IntoIterator<Item = (String, String)>) -> Result<Self> {
+        let values = values.into_iter().collect::<HashMap<_, _>>();
+        Self::from_lookup(|key| values.get(key).cloned())
+    }
+
     pub fn from_lookup<F>(lookup: F) -> Result<Self>
     where
         F: Fn(&str) -> Option<String>,
@@ -240,7 +245,7 @@ impl AppConfig {
         };
         let user_prompt = optional_non_empty(&lookup, "SARCASTIC_CONDENSED_USER_PROMPT");
         if let Some(template) = user_prompt.as_deref() {
-            parse_go_template(template)?;
+            render_go_template(template, [("ChatHistory", "__config_validation_probe__")])?;
         }
         let condensed_prompts = CondensedPromptConfig {
             system_prompt: optional_non_empty(&lookup, "SARCASTIC_CONDENSED_SYSTEM_PROMPT"),
