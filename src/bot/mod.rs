@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use context::AppContext;
 
 pub async fn run(ctx: Arc<AppContext>) -> Result<()> {
-    let bot = Bot::new(&ctx.config.telegram.bot_token);
+    let bot = ctx.config.telegram.bot();
     let webhook_url = ctx.config.telegram.webhook_url.clone();
 
     // Register bot commands with Telegram for menu display.

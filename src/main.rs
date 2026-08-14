@@ -1,15 +1,8 @@
-mod bot;
-mod config;
-mod db;
-mod http;
-mod i18n;
-mod services;
-mod telemetry;
-
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use insights_bot_telegram_rs::{bot, config, db, http, i18n, services, telemetry};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -46,8 +39,15 @@ async fn run() -> Result<()> {
     if telegraph.is_some() {
         info!("Telegraph service initialized");
     }
-    let ctx =
-        bot::context::AppContext::new(config, database.clone(), i18n, openai, limiter, telegraph);
+    let ctx = bot::context::AppContext::new(
+        config,
+        database.clone(),
+        i18n,
+        openai,
+        limiter,
+        telegraph,
+        bot::context::RecapRuntimeDependencies::default(),
+    );
 
     info!(
         "bootstrap completed (backend: {:?}, locale: {})",
@@ -91,9 +91,7 @@ fn load_env() -> Result<()> {
         && let Some(dir) = exe_path.parent()
     {
         let env_path = dir.join(".env");
-        if env_path.exists()
-            && dotenvy::from_path(&env_path).is_err()
-        {
+        if env_path.exists() && dotenvy::from_path(&env_path).is_err() {
             load_env_lenient(&env_path)?;
         }
     }

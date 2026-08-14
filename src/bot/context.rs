@@ -15,6 +15,27 @@ pub struct AppContext {
     pub openai: OpenAiClient,
     pub limiter: CommandRateLimiter,
     pub telegraph: Option<TelegraphService>,
+    /// Task 3 installs the concrete Redis-backed recap state client here.
+    pub recap_redis_client: Option<redis::Client>,
+    /// Shared HTTP transport for Task 4's raw Telegram Rich Message client.
+    pub raw_telegram_http: reqwest::Client,
+}
+
+#[derive(Clone)]
+pub struct RecapRuntimeDependencies {
+    /// Task 3 installs the concrete Redis-backed recap state client here.
+    pub recap_redis_client: Option<redis::Client>,
+    /// Shared HTTP transport for Task 4's raw Telegram Rich Message client.
+    pub raw_telegram_http: reqwest::Client,
+}
+
+impl Default for RecapRuntimeDependencies {
+    fn default() -> Self {
+        Self {
+            recap_redis_client: None,
+            raw_telegram_http: reqwest::Client::new(),
+        }
+    }
 }
 
 impl AppContext {
@@ -25,6 +46,7 @@ impl AppContext {
         openai: OpenAiClient,
         limiter: CommandRateLimiter,
         telegraph: Option<TelegraphService>,
+        recap_runtime: RecapRuntimeDependencies,
     ) -> Arc<Self> {
         Arc::new(Self {
             config,
@@ -33,6 +55,8 @@ impl AppContext {
             openai,
             limiter,
             telegraph,
+            recap_redis_client: recap_runtime.recap_redis_client,
+            raw_telegram_http: recap_runtime.raw_telegram_http,
         })
     }
 }

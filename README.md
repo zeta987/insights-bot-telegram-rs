@@ -21,6 +21,7 @@ Telegram-only rewrite of the recap bot inspired by the original Go implementatio
 ## Setup
 1. Copy `.env` from project template and set:
    - `TELEGRAM_BOT_TOKEN`
+   - `REDIS_PORT` (`1..=65535`; Redis host defaults to `localhost`)
    - `DATABASE_URL` (Postgres) or `SQLITE_PATH` (fallback)
    - `OPENAI_API_SECRET` (or `OPENAI_API_KEY`)
    - `INSIGHTS_LANG` (`en` / `zh-Hans` / `zh-Hant`)
@@ -31,6 +32,29 @@ Telegram-only rewrite of the recap bot inspired by the original Go implementatio
    cargo check
    ```
 3. (Optional) create DB schema via `sqlx` migrations (not included yet).
+
+### Recap parity configuration
+
+`OPENAI_API_SECRET` is canonical; `OPENAI_API_KEY` is used only when the
+canonical variable is absent. Detailed models default to `gpt-3.5-turbo`, total
+recap tokens default to `4096`, recap reserve defaults to `2000`, and summary
+language defaults to `Simplified Chinese`. The total minus reserve must be
+strictly positive. Backup-model variables are comma-separated, trim empty
+entries, preserve order, remove duplicates and the primary model; Check backups
+are ignored when `CHECK_MODEL` is unset.
+
+`REDIS_PORT` is mandatory and accepts only `1..=65535`. Missing or empty Redis
+hosts normalize to `localhost`; TLS and client-cache switches accept exactly
+`true` or `1`; an invalid or negative Redis DB selects database `0`. The manual
+recap interval is in seconds and invalid or negative values become `0`.
+
+`TELEGRAM_BOT_API_ENDPOINT` defaults to `https://api.telegram.org`; a custom
+endpoint must be an absolute HTTP(S) base URL and trailing slashes are removed.
+The same base is used for ordinary teloxide calls and Rich Message transport.
+`SARCASTIC_CONDENSED_USER_PROMPT` is validated as a Go-compatible template at
+startup. `AUTO_RECAP_TEST_ENABLED=true` or `1` with a nonzero
+`AUTO_RECAP_TEST_CHAT_ID` schedules one immediate automatic recap in addition
+to the normal schedule.
 
 ## Database behavior
 - Attempts Postgres first; on failure logs warning and connects to SQLite (`sqlite://{SQLITE_PATH}`).

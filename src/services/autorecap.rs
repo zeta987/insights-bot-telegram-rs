@@ -82,12 +82,15 @@ async fn run_once(ctx: Arc<AppContext>) -> anyhow::Result<()> {
     }
 
     // Filter to only configs that are due based on schedule slots
-    let due_configs: Vec<_> = configs.into_iter().filter(|c| is_due_for_recap(c, now)).collect();
+    let due_configs: Vec<_> = configs
+        .into_iter()
+        .filter(|c| is_due_for_recap(c, now))
+        .collect();
     if due_configs.is_empty() {
         return Ok(());
     }
 
-    let bot = Bot::new(&ctx.config.telegram.bot_token);
+    let bot = ctx.config.telegram.bot();
     let service = RecapService::new(&ctx.db, &ctx.openai);
 
     for cfg in due_configs {
@@ -98,7 +101,10 @@ async fn run_once(ctx: Arc<AppContext>) -> anyhow::Result<()> {
             match chat_history::messages_since_hours(&ctx.db.pool, cfg.chat_id, hours).await {
                 Ok(msgs) => msgs,
                 Err(err) => {
-                    warn!("auto_recap fetch messages for chat {} failed: {err:?}", cfg.chat_id);
+                    warn!(
+                        "auto_recap fetch messages for chat {} failed: {err:?}",
+                        cfg.chat_id
+                    );
                     continue;
                 }
             };
@@ -250,9 +256,7 @@ async fn handle_pin(bot: &Bot, ctx: &AppContext, cfg: &RecapConfig, new_msg_id: 
 }
 
 async fn update_last_recap_at(ctx: &AppContext, chat_id: i64, now: i64) {
-    if let Err(err) =
-        crate::db::recap_config::set_last_recap_at(&ctx.db.pool, chat_id, now).await
-    {
+    if let Err(err) = crate::db::recap_config::set_last_recap_at(&ctx.db.pool, chat_id, now).await {
         warn!("update last_recap_at failed: {err:?}");
     }
 }
