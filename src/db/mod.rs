@@ -8,12 +8,16 @@ use crate::config::DbConfig;
 pub mod chat_history;
 pub mod codec;
 pub mod feature_flags;
+pub mod feedback;
 pub mod logs;
 pub mod migration;
 pub mod models;
 pub mod recap_config;
+pub mod recap_logs;
 pub mod recap_options;
+pub mod sent_messages;
 pub mod subscribers;
+pub mod usage_metrics;
 
 #[derive(Debug, Clone, Copy)]
 pub enum DbBackend {
