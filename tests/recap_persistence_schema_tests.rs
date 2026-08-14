@@ -906,6 +906,148 @@ async fn the_two_migrations_extend_chat_histories_with_the_same_specifications()
     }
 }
 
+/// Every Go `field.Int` column this slice declares.
+///
+/// ent v0.13.1 maps `field.TypeInt` and `field.TypeInt64` onto the same
+/// PostgreSQL type, `bigint` (`dialect/sql/schema/postgres.go` lines 344-351), so
+/// a `field.Int` column must not be narrowed to `INTEGER`. The normalized
+/// cross-engine comparison folds `BIGINT` and `INTEGER` onto one SQLite spelling
+/// and therefore cannot see this drift on its own.
+const POSTGRES_BIGINT_FIELD_INT_COLUMNS: [(&str, &str); 16] = [
+    ("telegram_chat_recaps_options", "auto_recap_send_mode"),
+    ("telegram_chat_recaps_options", "auto_recap_rates_per_day"),
+    ("chat_histories", "from_platform"),
+    ("log_chat_histories_recaps", "from_platform"),
+    ("log_chat_histories_recaps", "prompt_token_usage"),
+    ("log_chat_histories_recaps", "completion_token_usage"),
+    ("log_chat_histories_recaps", "total_token_usage"),
+    ("log_chat_histories_recaps", "recap_type"),
+    ("sent_messages", "message_id"),
+    ("sent_messages", "from_platform"),
+    ("sent_messages", "message_type"),
+    (
+        "metric_open_ai_chat_completion_token_usages",
+        "prompt_character_length",
+    ),
+    (
+        "metric_open_ai_chat_completion_token_usages",
+        "prompt_token_usage",
+    ),
+    (
+        "metric_open_ai_chat_completion_token_usages",
+        "completion_character_length",
+    ),
+    (
+        "metric_open_ai_chat_completion_token_usages",
+        "completion_token_usage",
+    ),
+    (
+        "metric_open_ai_chat_completion_token_usages",
+        "total_token_usage",
+    ),
+];
+
+/// `(table, column, declared type)` for every column the migration declares.
+///
+/// Unlike [`created_tables`] this keeps the type exactly as written, because
+/// Ent width drift is precisely what normalisation hides.
+fn declared_types(sql: &str) -> Vec<(String, String, String)> {
+    let mut declared = Vec::new();
+    let mut table: Option<String> = None;
+
+    for line in sql.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix("CREATE TABLE IF NOT EXISTS ") {
+            table = Some(rest.trim().trim_end_matches('(').trim().to_owned());
+            continue;
+        }
+        if trimmed.starts_with(')') {
+            table = None;
+            continue;
+        }
+        if let Some(rest) = trimmed.trim_end_matches(';').strip_prefix("ALTER TABLE ") {
+            let Some((altered, tail)) = rest.split_once(' ') else {
+                continue;
+            };
+            let tail = tail.trim();
+            let tail = tail
+                .strip_prefix("ADD COLUMN IF NOT EXISTS ")
+                .or_else(|| tail.strip_prefix("ADD COLUMN "))
+                .unwrap_or(tail);
+            let mut parts = tail.split_whitespace();
+            if let (Some(name), Some(kind)) = (parts.next(), parts.next()) {
+                declared.push((
+                    altered.to_owned(),
+                    name.trim_matches('"').to_owned(),
+                    kind.to_ascii_uppercase(),
+                ));
+            }
+            continue;
+        }
+
+        let Some(table) = table.as_ref() else {
+            continue;
+        };
+        if trimmed.is_empty() || trimmed.starts_with("--") {
+            continue;
+        }
+        let mut parts = trimmed.split_whitespace();
+        if let (Some(name), Some(kind)) = (parts.next(), parts.next()) {
+            declared.push((
+                table.clone(),
+                name.trim_matches('"').to_owned(),
+                kind.trim_end_matches(',').to_ascii_uppercase(),
+            ));
+        }
+    }
+    declared
+}
+
+#[tokio::test]
+async fn every_go_field_int_column_is_bigint_on_postgres() {
+    let declared = declared_types(PARITY_MIGRATION_POSTGRES);
+
+    for (table, column) in POSTGRES_BIGINT_FIELD_INT_COLUMNS {
+        let found = declared
+            .iter()
+            .find(|(owner, name, _)| owner == table && name == column)
+            .unwrap_or_else(|| panic!("{table}.{column} is missing from the migration"));
+        assert_eq!(
+            found.2, "BIGINT",
+            "{table}.{column} is a Go field.Int, which ent maps to bigint"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_postgres_migration_declares_no_narrow_integer_column() {
+    // Both field.Int and field.Int64 land on bigint, so nothing this slice
+    // declares may be narrower.
+    let narrow: Vec<String> = declared_types(PARITY_MIGRATION_POSTGRES)
+        .into_iter()
+        .filter(|(_, _, kind)| kind == "INTEGER" || kind == "SMALLINT")
+        .map(|(table, column, kind)| format!("{table}.{column} {kind}"))
+        .collect();
+    assert!(
+        narrow.is_empty(),
+        "PostgreSQL must not narrow an ent integer: {narrow:?}"
+    );
+
+    // SQLite keeps its own spelling; its INTEGER is already 64-bit.
+    let sqlite = declared_types(PARITY_MIGRATION_SQLITE);
+    for (table, column) in POSTGRES_BIGINT_FIELD_INT_COLUMNS {
+        let found = sqlite
+            .iter()
+            .find(|(owner, name, _)| owner == table && name == column)
+            .unwrap_or_else(|| panic!("{table}.{column} is missing from the SQLite migration"));
+        assert_eq!(
+            found.2, "INTEGER",
+            "{table}.{column} must stay SQLite INTEGER"
+        );
+    }
+}
+
 #[tokio::test]
 async fn uniqueness_and_the_reaction_check_sit_exactly_where_go_puts_them() {
     for (engine, migration) in [

@@ -18,9 +18,9 @@ CREATE TABLE IF NOT EXISTS telegram_chat_feature_flags (
 CREATE TABLE IF NOT EXISTS telegram_chat_recaps_options (
     id UUID PRIMARY KEY,
     chat_id BIGINT NOT NULL UNIQUE,
-    auto_recap_send_mode INTEGER NOT NULL DEFAULT 0,
+    auto_recap_send_mode BIGINT NOT NULL DEFAULT 0,
     manual_recap_rate_per_seconds BIGINT NOT NULL DEFAULT 0,
-    auto_recap_rates_per_day INTEGER NOT NULL DEFAULT 0,
+    auto_recap_rates_per_day BIGINT NOT NULL DEFAULT 0,
     pin_auto_recap_message BOOLEAN NOT NULL DEFAULT FALSE,
     created_at BIGINT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL DEFAULT 0
@@ -40,11 +40,11 @@ CREATE TABLE IF NOT EXISTS log_chat_histories_recaps (
     chat_id BIGINT NOT NULL DEFAULT 0,
     recap_inputs TEXT NOT NULL DEFAULT '',
     recap_outputs TEXT NOT NULL DEFAULT '',
-    from_platform INTEGER NOT NULL DEFAULT 0,
-    prompt_token_usage INTEGER NOT NULL DEFAULT 0,
-    completion_token_usage INTEGER NOT NULL DEFAULT 0,
-    total_token_usage INTEGER NOT NULL DEFAULT 0,
-    recap_type INTEGER NOT NULL DEFAULT 0,
+    from_platform BIGINT NOT NULL DEFAULT 0,
+    prompt_token_usage BIGINT NOT NULL DEFAULT 0,
+    completion_token_usage BIGINT NOT NULL DEFAULT 0,
+    total_token_usage BIGINT NOT NULL DEFAULT 0,
+    recap_type BIGINT NOT NULL DEFAULT 0,
     model_name TEXT NOT NULL DEFAULT '',
     created_at BIGINT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL DEFAULT 0
@@ -77,11 +77,11 @@ CREATE TABLE IF NOT EXISTS feedback_summarizations_reactions (
 CREATE TABLE IF NOT EXISTS sent_messages (
     id UUID PRIMARY KEY,
     chat_id BIGINT NOT NULL DEFAULT 0,
-    message_id INTEGER NOT NULL DEFAULT 0,
+    message_id BIGINT NOT NULL DEFAULT 0,
     text TEXT NOT NULL DEFAULT '',
     is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
-    from_platform INTEGER NOT NULL DEFAULT 0,
-    message_type INTEGER NOT NULL DEFAULT 0,
+    from_platform BIGINT NOT NULL DEFAULT 0,
+    message_type BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL DEFAULT 0,
     updated_at BIGINT NOT NULL DEFAULT 0
 );
@@ -90,11 +90,11 @@ CREATE TABLE IF NOT EXISTS sent_messages (
 CREATE TABLE IF NOT EXISTS metric_open_ai_chat_completion_token_usages (
     id UUID PRIMARY KEY,
     prompt_operation TEXT NOT NULL DEFAULT '',
-    prompt_character_length INTEGER NOT NULL DEFAULT 0,
-    prompt_token_usage INTEGER NOT NULL DEFAULT 0,
-    completion_character_length INTEGER NOT NULL DEFAULT 0,
-    completion_token_usage INTEGER NOT NULL DEFAULT 0,
-    total_token_usage INTEGER NOT NULL DEFAULT 0,
+    prompt_character_length BIGINT NOT NULL DEFAULT 0,
+    prompt_token_usage BIGINT NOT NULL DEFAULT 0,
+    completion_character_length BIGINT NOT NULL DEFAULT 0,
+    completion_token_usage BIGINT NOT NULL DEFAULT 0,
+    total_token_usage BIGINT NOT NULL DEFAULT 0,
     model_name TEXT NOT NULL DEFAULT '',
     created_at BIGINT NOT NULL DEFAULT 0
 );
@@ -114,5 +114,5 @@ ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS replied_to_text TEXT NOT NUL
 ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS replied_to_chat_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS chatted_at BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS embedded BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS from_platform INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS from_platform BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE chat_histories ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0;

@@ -71,10 +71,14 @@ impl SchemaFixture {
     /// Calling this twice against the same fixture exercises the re-run path
     /// that a restarted process takes.
     pub async fn bootstrap(&self) -> AnyPool {
+        self.bootstrap_database().await.pool
+    }
+
+    /// The bootstrapped handle itself, for repositories that branch on backend.
+    pub async fn bootstrap_database(&self) -> Database {
         Database::connect_from_env(&self.db_config())
             .await
             .expect("the application bootstrap must succeed")
-            .pool
     }
 }
 

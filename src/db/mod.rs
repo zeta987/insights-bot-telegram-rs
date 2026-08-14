@@ -6,10 +6,14 @@ use url::Url;
 use crate::config::DbConfig;
 
 pub mod chat_history;
+pub mod codec;
+pub mod feature_flags;
 pub mod logs;
 pub mod migration;
 pub mod models;
 pub mod recap_config;
+pub mod recap_options;
+pub mod subscribers;
 
 #[derive(Debug, Clone, Copy)]
 pub enum DbBackend {
