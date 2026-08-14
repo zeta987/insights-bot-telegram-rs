@@ -1,8 +1,11 @@
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use insights_bot_telegram_rs::{bot, config, db, http, i18n, services, telemetry};
+use insights_bot_telegram_rs::{
+    bot, config, db, http, i18n, redis::recap_state as recap_redis_state, services, telemetry,
+};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -43,6 +46,7 @@ async fn run() -> Result<()> {
     if telegraph.is_some() {
         info!("Telegraph service initialized");
     }
+    let recap_state = connect_recap_state(&config.redis).await?;
     let ctx = bot::context::AppContext::new(
         config,
         database.clone(),
@@ -50,7 +54,10 @@ async fn run() -> Result<()> {
         openai,
         limiter,
         telegraph,
-        bot::context::RecapRuntimeDependencies::default(),
+        bot::context::RecapRuntimeDependencies {
+            recap_state: Some(recap_state),
+            ..Default::default()
+        },
     );
 
     info!(
@@ -69,6 +76,22 @@ async fn run() -> Result<()> {
     // Start bot dispatcher.
     bot::run(ctx).await?;
     Ok(())
+}
+
+/// Connect the recap state store described by the Redis configuration.
+///
+/// Redis is required infrastructure. Go's provider returns any client-creation
+/// or thirty-second `PING` failure to the application container, which aborts
+/// startup, so a failure here stops the bot instead of disabling recap.
+///
+/// The error arrives already reduced to an operation name and an error kind, so
+/// the address, the credentials, and any stored payload stay out of the log.
+async fn connect_recap_state(
+    redis: &config::RedisConfig,
+) -> Result<Arc<dyn recap_redis_state::RecapStateStore>> {
+    let store = recap_redis_state::RedisRecapStateStore::connect(redis).await?;
+    info!("recap Redis state store connected");
+    Ok(Arc::new(store))
 }
 
 /// Load environment variables, falling back to lenient parsing for .env files

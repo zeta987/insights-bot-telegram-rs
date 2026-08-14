@@ -4,6 +4,7 @@ use crate::{
     config::AppConfig,
     db::Database,
     i18n::I18n,
+    redis::recap_state::RecapStateStore,
     services::{openai::OpenAiClient, rate_limit::CommandRateLimiter, telegraph::TelegraphService},
 };
 
@@ -15,16 +16,18 @@ pub struct AppContext {
     pub openai: OpenAiClient,
     pub limiter: CommandRateLimiter,
     pub telegraph: Option<TelegraphService>,
-    /// Task 3 installs the concrete Redis-backed recap state client here.
-    pub recap_redis_client: Option<redis::Client>,
+    /// Recap state store. Production always installs one; `None` exists for
+    /// test injection and for handlers that are still being staged.
+    pub recap_state: Option<Arc<dyn RecapStateStore>>,
     /// Shared HTTP transport for Task 7's raw Telegram Rich Message client.
     pub raw_telegram_http: reqwest::Client,
 }
 
 #[derive(Clone)]
 pub struct RecapRuntimeDependencies {
-    /// Task 3 installs the concrete Redis-backed recap state client here.
-    pub recap_redis_client: Option<redis::Client>,
+    /// Recap state store. Production always installs one; `None` exists for
+    /// test injection and for handlers that are still being staged.
+    pub recap_state: Option<Arc<dyn RecapStateStore>>,
     /// Shared HTTP transport for Task 7's raw Telegram Rich Message client.
     pub raw_telegram_http: reqwest::Client,
 }
@@ -32,7 +35,7 @@ pub struct RecapRuntimeDependencies {
 impl Default for RecapRuntimeDependencies {
     fn default() -> Self {
         Self {
-            recap_redis_client: None,
+            recap_state: None,
             raw_telegram_http: reqwest::Client::new(),
         }
     }
@@ -55,7 +58,7 @@ impl AppContext {
             openai,
             limiter,
             telegraph,
-            recap_redis_client: recap_runtime.recap_redis_client,
+            recap_state: recap_runtime.recap_state,
             raw_telegram_http: recap_runtime.raw_telegram_http,
         })
     }
