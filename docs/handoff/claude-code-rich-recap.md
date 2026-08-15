@@ -98,6 +98,8 @@ The current automatic-recap checkpoint adds:
 - Ten-attempt feature/options/subscriber reads, disabled/private-only decisions,
   pre-generation requeue, and the bounded Rust replacement for Go's nil-options
   dereference.
+- Startup seeding uses Go's two phases: load or create options for every enabled
+  chat first, then queue only the successful chats in a second pass.
 - Rich recap generation from the parity history/log repositories, public-first
   delivery, duplicate subscriber fan-out, shared five-per-second send limiter,
   subscriber unsubscribe keyboards, partial-send persistence, pin replacement,
@@ -119,20 +121,18 @@ Latest verification before this handoff:
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
 - `/configure_recap` focused tests passed: 11.
-- Automatic-recap focused tests passed: worker 9, queue 11, delivery 8.
+- Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
 
 ## Next required slice
 
 Continue the read-only pinned-Go versus Rust audit of the completed automatic
 worker and configuration runtime; passing tests do not prove every error branch.
 The ordinary-member, creator-only, GroupAnonymousBot actor lookup, expired
-payload, toggle-off queue retention, and disabled-rate-rescore branches are
-complete. The next confirmed difference is startup queue seeding order: pinned
-Go first creates or loads options for every enabled chat, then performs queue
-writes in a second loop; Rust currently creates and queues one chat at a time.
-Add an observable RED ordering test, then port the two-phase loop. Afterwards
-check original-message anonymous-origin exceptions, production worker
-invocation, and the callback group-only and remaining Bot API failure branches.
+payload, toggle-off queue retention, disabled-rate-rescore, and two-phase
+startup seed branches are complete. Next verify production worker invocation
+and direct test-capsule startup behavior, then check original-message
+anonymous-origin exceptions plus the callback group-only and remaining Bot API
+failure branches.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
 fresh structural callsite inventory to select the next non-`/smr` Telegram gap.

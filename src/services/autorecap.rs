@@ -46,6 +46,46 @@ use crate::{
 const STATE_READ_ATTEMPTS: usize = 10;
 const AUTO_RECAP_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Startup operations kept behind a seam so Go's two-pass ordering remains
+/// observable: every options row is loaded before the first queue write.
+#[async_trait]
+pub trait AutoRecapStartupSeeder: Send + Sync {
+    async fn list_enabled_chat_ids(&self) -> Result<Vec<i64>>;
+
+    async fn find_or_create_rate(&self, chat_id: i64) -> Result<i64>;
+
+    async fn queue_chat(&self, chat_id: i64, rates_per_day: i64);
+}
+
+/// Seed enabled chats in the two phases used by pinned Go v1.0.0.
+pub async fn seed_enabled_auto_recaps<S>(seeder: &S)
+where
+    S: AutoRecapStartupSeeder + ?Sized,
+{
+    let chat_ids = match seeder.list_enabled_chat_ids().await {
+        Ok(chat_ids) => chat_ids,
+        Err(source) => {
+            error!(error = %source, "failed to list enabled automatic recap chats");
+            return;
+        }
+    };
+
+    let mut ready = Vec::with_capacity(chat_ids.len());
+    for chat_id in chat_ids {
+        match seeder.find_or_create_rate(chat_id).await {
+            Ok(rates_per_day) => ready.push((chat_id, rates_per_day)),
+            Err(source) => error!(
+                chat_id,
+                error = %source,
+                "failed to find or create automatic recap options"
+            ),
+        }
+    }
+    for (chat_id, rates_per_day) in ready {
+        seeder.queue_chat(chat_id, rates_per_day).await;
+    }
+}
+
 /// The three database reads a popped Go TimeCapsule performs before requeueing.
 #[async_trait]
 pub trait AutoRecapStateReader: Send + Sync {
@@ -327,32 +367,40 @@ pub async fn spawn_autorecap(ctx: Arc<AppContext>) {
 }
 
 async fn queue_all_enabled_chats(ctx: &AppContext, state: &dyn RecapStateStore) {
-    let chats = match feature_flags::list_recap_enabled_groups(&ctx.db).await {
-        Ok(chats) => chats,
-        Err(source) => {
-            error!(error = %source, "failed to list enabled automatic recap chats");
-            return;
-        }
-    };
+    let seeder = DatabaseAutoRecapStartupSeeder { ctx, state };
+    seed_enabled_auto_recaps(&seeder).await;
+}
 
-    for chat in chats {
-        match recap_options::find_one_or_create(&ctx.db, chat.chat_id).await {
-            Ok(options) => {
-                queue_next_auto_recap(
-                    state,
-                    chat.chat_id,
-                    options.auto_recap_rates_per_day,
-                    ctx.config.timezone_shift_seconds,
-                    Utc::now().timestamp_millis(),
-                )
-                .await;
-            }
-            Err(source) => error!(
-                chat_id = chat.chat_id,
-                error = %source,
-                "failed to find or create automatic recap options"
-            ),
-        }
+struct DatabaseAutoRecapStartupSeeder<'a> {
+    ctx: &'a AppContext,
+    state: &'a dyn RecapStateStore,
+}
+
+#[async_trait]
+impl AutoRecapStartupSeeder for DatabaseAutoRecapStartupSeeder<'_> {
+    async fn list_enabled_chat_ids(&self) -> Result<Vec<i64>> {
+        Ok(feature_flags::list_recap_enabled_groups(&self.ctx.db)
+            .await?
+            .into_iter()
+            .map(|chat| chat.chat_id)
+            .collect())
+    }
+
+    async fn find_or_create_rate(&self, chat_id: i64) -> Result<i64> {
+        Ok(recap_options::find_one_or_create(&self.ctx.db, chat_id)
+            .await?
+            .auto_recap_rates_per_day)
+    }
+
+    async fn queue_chat(&self, chat_id: i64, rates_per_day: i64) {
+        queue_next_auto_recap(
+            self.state,
+            chat_id,
+            rates_per_day,
+            self.ctx.config.timezone_shift_seconds,
+            Utc::now().timestamp_millis(),
+        )
+        .await;
     }
 }
 

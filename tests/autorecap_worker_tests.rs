@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -12,8 +12,9 @@ use insights_bot_telegram_rs::{
         recap_state::{InMemoryRecapStateStore, TestClock},
     },
     services::autorecap::{
-        AutoRecapPreparation, AutoRecapStateReader, build_auto_recap_targets,
-        has_enough_auto_recap_histories, prepare_auto_recap, read_auto_recap_state,
+        AutoRecapPreparation, AutoRecapStartupSeeder, AutoRecapStateReader,
+        build_auto_recap_targets, has_enough_auto_recap_histories, prepare_auto_recap,
+        read_auto_recap_state, seed_enabled_auto_recaps,
     },
 };
 
@@ -119,6 +120,42 @@ struct FixedReader {
     subscribers: Vec<TelegramChatAutoRecapsSubscriber>,
 }
 
+#[derive(Default)]
+struct RecordingStartupSeeder {
+    events: Mutex<Vec<String>>,
+}
+
+impl RecordingStartupSeeder {
+    fn events(&self) -> Vec<String> {
+        self.events.lock().expect("event lock").clone()
+    }
+
+    fn record(&self, event: impl Into<String>) {
+        self.events.lock().expect("event lock").push(event.into());
+    }
+}
+
+#[async_trait]
+impl AutoRecapStartupSeeder for RecordingStartupSeeder {
+    async fn list_enabled_chat_ids(&self) -> anyhow::Result<Vec<i64>> {
+        self.record("list");
+        Ok(vec![11, 22, 33])
+    }
+
+    async fn find_or_create_rate(&self, chat_id: i64) -> anyhow::Result<i64> {
+        self.record(format!("options:{chat_id}"));
+        if chat_id == 22 {
+            Err(anyhow!("options unavailable"))
+        } else {
+            Ok(if chat_id == 11 { 2 } else { 4 })
+        }
+    }
+
+    async fn queue_chat(&self, chat_id: i64, rates_per_day: i64) {
+        self.record(format!("queue:{chat_id}:{rates_per_day}"));
+    }
+}
+
 #[async_trait]
 impl AutoRecapStateReader for FixedReader {
     async fn recap_enabled(&self, _chat_id: i64) -> anyhow::Result<bool> {
@@ -142,6 +179,25 @@ impl AutoRecapStateReader for FixedReader {
 
 fn queue_store() -> InMemoryRecapStateStore {
     InMemoryRecapStateStore::new(Arc::new(TestClock::new(NOW_MS)))
+}
+
+#[tokio::test]
+async fn startup_seed_loads_every_option_before_queueing_successful_chats() {
+    let seeder = RecordingStartupSeeder::default();
+
+    seed_enabled_auto_recaps(&seeder).await;
+
+    assert_eq!(
+        seeder.events(),
+        [
+            "list",
+            "options:11",
+            "options:22",
+            "options:33",
+            "queue:11:2",
+            "queue:33:4",
+        ]
+    );
 }
 
 #[tokio::test]
