@@ -151,6 +151,23 @@ The current configuration-error checkpoint ports Go's stage-specific
   corruption/RAISE triggers, and a `put_callback`-failing state store
   wrapper.
 
+The current bot-left wiring checkpoint connects the production router to the
+existing cleanup:
+
+- `src/bot/router.rs` adds an `Update::filter_my_chat_member()` branch ending
+  in `src/bot/handlers/chat_member.rs::handle_my_chat_member`.
+- Only `update.new_chat_member.is_left()` triggers
+  `chat_cleanup::prune_chat_data_after_bot_left(&db, update.chat.id.0)`;
+  teloxide-core 0.11.2 `is_left()` matches only the `Left` variant, so a ban
+  (`kicked`) falls through exactly like Go's unmatched status branch, and no
+  Telegram request is sent on either path.
+- The ordinary `left_chat_member` branch that removes one subscriber is
+  untouched.
+- `tests/chat_member_tests.rs` proves the left update performs the five-step
+  cleanup (subscribers, feature flags, recap options, chat histories, blanked
+  recap log text with the row retained) with zero Telegram requests, and that
+  a banned update changes nothing.
+
 Latest verification before this handoff:
 
 - `cargo fmt --check` reports only the known `src/db/recap_config.rs` and
@@ -159,6 +176,7 @@ Latest verification before this handoff:
   `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
 - `/configure_recap` focused tests passed: 26.
+- Bot-left chat member focused tests passed: 2.
 - Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
 
 ## Deferred parity decisions
@@ -181,32 +199,16 @@ deliberately deferred; get an explicit decision before acting on either:
 
 ## Next required slice
 
-The next confirmed production wiring gap is bot-left cleanup:
+The bot-left production wiring is complete, and an earlier top-level
+dispatcher inventory found no other missing in-scope recap registration:
+recap commands, start/cancel continuations, all nine callback routes,
+ordinary `left_chat_member`, migration, and now `my_chat_member` are wired in
+Rust. Go's channel-post and summarization-retry registrations belong to
+excluded `/smr`.
 
-- Go registers `OnMyChatMember` in `welcome/welcome.go:56-65` and, only when
-  `new_chat_member.status == left`, calls its best-effort five-step cleanup.
-- Rust already implements the exact independent cleanup order in
-  `src/db/chat_cleanup.rs` and tests the repository side effects, but
-  `src/bot/router.rs` has no `Update::filter_my_chat_member()` branch, so the
-  production function is unreachable.
-- Add a router endpoint that ignores non-left statuses and invokes
-  `prune_chat_data_after_bot_left(db, update.chat.id)` without a Telegram reply.
-  Write a dispatcher-level test for a left update plus a non-left control; keep
-  the existing ordinary `left_chat_member` subscriber-removal branch separate.
-- This checkout uses teloxide 0.14. Its concrete seam is
-  `Update::filter_my_chat_member()` yielding `ChatMemberUpdated`; the predicate
-  can call `update.new_chat_member.is_left()`, and the chat ID is
-  `update.chat.id.0`. In teloxide-core 0.11.2, `is_left()` matches only the
-  `Left` variant and excludes `Banned`, preserving Go's exact `status == left`;
-  use a banned update as the non-left control.
-- A fresh top-level dispatcher inventory found no other missing in-scope recap
-  registration: recap commands, start/cancel continuations, all nine callback
-  routes, ordinary `left_chat_member`, and migration are wired in Rust. Go's
-  channel-post and summarization-retry registrations belong to excluded `/smr`.
-
-When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
-fresh structural callsite inventory to select the next non-`/smr` Telegram gap.
-Continue module by module until every in-scope Go command, middleware, callback,
+Use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a fresh structural
+callsite inventory to select the next non-`/smr` Telegram gap. Continue
+module by module until every in-scope Go command, middleware, callback,
 persistence side effect, Redis lifecycle, and Telegram delivery callsite has a
 Rust equivalent or a documented approved deviation. Port 9487 and AyuGram are
 available for a later live Telegram test after local verification.
@@ -237,8 +239,8 @@ available, read its latest messages too. Then check `.git/index.lock`, current
 branch, latest signed commits, and the unstaged/staged diff without reading any
 `.env*` file. Preserve the completed automatic-recap checkpoint and continue
 the pinned Go v1.0.0 1:1 port from the audit and next-gap procedure described
-above. Begin with the bot-left router wiring under `Next required slice`; do not
-broadly refactor existing handlers. Do not redo
+above. Begin with the fresh non-`/smr` callsite inventory under `Next required
+slice`; do not broadly refactor existing handlers. Do not redo
 completed modules merely because their implementation is
 unfamiliar: compare production callsites and tests first. Use TDD, keep edits
 scoped, run focused plus full Rust verification, perform a staged secrets/PII

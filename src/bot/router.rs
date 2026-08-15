@@ -6,8 +6,8 @@ use crate::bot::{
     commands::{Command, parse_go_command},
     context::AppContext,
     handlers::{
-        migration::MigrationHandlers, recap::RecapHandlers, recap_forwarded, recap_subscription,
-        system::SystemHandlers,
+        chat_member, migration::MigrationHandlers, recap::RecapHandlers, recap_forwarded,
+        recap_subscription, system::SystemHandlers,
     },
     middleware,
 };
@@ -77,10 +77,16 @@ pub fn build_dispatcher(
     let callback_handler =
         Update::filter_callback_query().endpoint(RecapHandlers::handle_callback_query_with_me);
 
+    // Go `welcome.go:57` OnMyChatMember: only the bot's own `left` status
+    // triggers the five-step cleanup; the handler filters the status itself.
+    let my_chat_member_handler =
+        Update::filter_my_chat_member().endpoint(chat_member::handle_my_chat_member);
+
     let handler = dptree::entry()
         .branch(message_handler)
         .branch(edited_message_handler)
-        .branch(callback_handler);
+        .branch(callback_handler)
+        .branch(my_chat_member_handler);
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![ctx.clone()])

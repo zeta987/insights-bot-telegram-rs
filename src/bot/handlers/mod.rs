@@ -1,3 +1,4 @@
+pub mod chat_member;
 pub mod migration;
 pub mod recap;
 pub mod recap_configure;
