@@ -1,19 +1,226 @@
 //! `/configure_recap` keyboard parity against Go v1.0.0 `02aee8ce`.
 
-use std::sync::Arc;
+mod support;
+
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use insights_bot_telegram_rs::{
-    bot::handlers::recap_configure::{ConfigureRecapView, build_configure_keyboard},
+    bot::{
+        context::{AppContext, RecapRuntimeDependencies},
+        handlers::{
+            recap::RecapHandlers,
+            recap_configure::{
+                ConfigureRecapView, build_configure_keyboard, handle_configure_recap,
+            },
+        },
+    },
+    config::AppConfig,
+    db::{Database, feature_flags, recap_options},
+    i18n::I18n,
     redis::{
         keys,
         recap_state::{InMemoryRecapStateStore, RecapStateStore, TestClock},
     },
+    services::{
+        autorecap_queue::encode_auto_recap_member,
+        openai::OpenAiClient,
+        rate_limit::{CommandRateLimiter, GoRateLimiter},
+    },
 };
 use serde_json::Value;
+use support::sqlite_fixture::SchemaFixture;
+use teloxide::types::{CallbackQuery, Me, Message};
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{body_partial_json, method, path},
+};
 
 const START_MS: i64 = 1_700_000_000_000;
 const CHAT_ID: i64 = -1_001_234_567_890;
 const FROM_ID: i64 = 42;
+
+fn bot_me() -> Me {
+    serde_json::from_value(serde_json::json!({
+        "id": 9_999,
+        "is_bot": true,
+        "first_name": "Test Bot",
+        "username": "TestBot",
+        "can_join_groups": true,
+        "can_read_all_group_messages": true,
+        "supports_inline_queries": false
+    }))
+    .expect("valid Telegram bot identity")
+}
+
+fn configure_command() -> Message {
+    serde_json::from_value(serde_json::json!({
+        "message_id": 77,
+        "date": 1_710_000_000,
+        "from": {
+            "id": FROM_ID,
+            "is_bot": false,
+            "first_name": "Ada",
+            "username": "ada"
+        },
+        "chat": {
+            "id": CHAT_ID,
+            "type": "supergroup",
+            "title": "Parity Lab"
+        },
+        "text": "/configure_recap"
+    }))
+    .expect("valid Telegram configure command")
+}
+
+fn telegram_administrator_result(user_id: i64, is_bot: bool) -> Value {
+    serde_json::json!({
+        "ok": true,
+        "result": {
+            "user": {
+                "id": user_id,
+                "is_bot": is_bot,
+                "first_name": if is_bot { "Test Bot" } else { "Ada" }
+            },
+            "status": "administrator",
+            "is_anonymous": false,
+            "can_be_edited": false,
+            "can_manage_chat": true,
+            "can_change_info": true,
+            "can_delete_messages": true,
+            "can_manage_video_chats": true,
+            "can_invite_users": true,
+            "can_restrict_members": true,
+            "can_pin_messages": true,
+            "can_promote_members": true
+        }
+    })
+}
+
+fn telegram_owner_result() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "result": {
+            "user": {
+                "id": FROM_ID,
+                "is_bot": false,
+                "first_name": "Ada"
+            },
+            "status": "creator",
+            "is_anonymous": false,
+            "custom_title": null
+        }
+    })
+}
+
+fn telegram_message_result() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "result": {
+            "message_id": 88,
+            "date": 1_710_000_001,
+            "chat": {"id": CHAT_ID, "type": "supergroup"},
+            "text": "configured"
+        }
+    })
+}
+
+fn configure_callback(wire: &str) -> CallbackQuery {
+    serde_json::from_value(serde_json::json!({
+        "id": "configure-callback",
+        "from": {
+            "id": FROM_ID,
+            "is_bot": false,
+            "first_name": "Ada",
+            "username": "ada"
+        },
+        "message": {
+            "message_id": 88,
+            "date": 1_710_000_001,
+            "from": {
+                "id": 9_999,
+                "is_bot": true,
+                "first_name": "Test Bot",
+                "username": "TestBot"
+            },
+            "chat": {
+                "id": CHAT_ID,
+                "type": "supergroup",
+                "title": "Parity Lab"
+            },
+            "reply_to_message": serde_json::to_value(configure_command())
+                .expect("serialize original command"),
+            "text": "好的。请在下面点击你想配置的选项进行操作吧。"
+        },
+        "chat_instance": "configure-chat-instance",
+        "data": wire
+    }))
+    .expect("valid configure callback")
+}
+
+fn request_body(request: &wiremock::Request) -> Value {
+    serde_json::from_slice(&request.body).unwrap_or_else(|_| {
+        let map = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .map(|(key, value)| (key, Value::String(value)))
+            .collect::<serde_json::Map<_, _>>();
+        Value::Object(map)
+    })
+}
+
+async fn command_context(
+    server: &MockServer,
+    database: Database,
+    state: Arc<dyn RecapStateStore>,
+) -> Arc<AppContext> {
+    let values = BTreeMap::from([
+        ("TELEGRAM_BOT_TOKEN".to_owned(), "test-token".to_owned()),
+        (
+            "TELEGRAM_BOT_API_ENDPOINT".to_owned(),
+            format!("{}/telegram", server.uri()),
+        ),
+        (
+            "OPENAI_API_SECRET".to_owned(),
+            "configure-test-key".to_owned(),
+        ),
+        ("OPENAI_API_HOST".to_owned(), format!("{}/v1", server.uri())),
+        (
+            "OPENAI_API_MODEL_NAME".to_owned(),
+            "detail-model".to_owned(),
+        ),
+        (
+            "SARCASTIC_CONDENSED_MODEL_NAME".to_owned(),
+            "condensed-model".to_owned(),
+        ),
+        ("REDIS_PORT".to_owned(), "6379".to_owned()),
+        (
+            "HARD_LIMIT_MANUAL_RECAP_RATE_PER_SECONDS".to_owned(),
+            "120".to_owned(),
+        ),
+        ("LOCALE".to_owned(), "zh-Hant".to_owned()),
+    ]);
+    let config =
+        AppConfig::from_lookup(|key| values.get(key).cloned()).expect("configure test config");
+    let openai = OpenAiClient::new(
+        &config.openai,
+        &config.recap_openai,
+        &config.condensed_prompts,
+    )
+    .expect("OpenAI test client")
+    .with_rate_limiter(Arc::new(GoRateLimiter::per_second(1_000)));
+    AppContext::new(
+        config,
+        database,
+        I18n::load_from_dir("locales").expect("embedded locales"),
+        openai,
+        CommandRateLimiter::new(1, Duration::from_secs(1)),
+        None,
+        RecapRuntimeDependencies {
+            recap_state: Some(state),
+            raw_telegram_http: reqwest::Client::new(),
+            message_preprocessor: None,
+        },
+    )
+}
 
 async fn stored_payload(state: &InMemoryRecapStateStore, route: &str, button: &Value) -> String {
     let wire = button["callback_data"]
@@ -147,4 +354,545 @@ async fn configure_keyboard_preserves_go_rows_labels_and_compact_callback_json()
         stored_payload(&state, keys::ROUTE_CONFIGURE_PIN, &enabled_rows[7][0]).await,
         r#"{"status":true,"chatId":-1001234567890}"#
     );
+}
+
+#[tokio::test]
+async fn configure_command_checks_bot_and_actor_and_keeps_missing_options_ephemeral() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(FROM_ID, false)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database.clone(), state).await;
+
+    handle_configure_recap(
+        context.config.telegram.bot(),
+        configure_command(),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("configure command");
+
+    assert!(
+        recap_options::find_one(&database, CHAT_ID)
+            .await
+            .expect("recap options lookup")
+            .is_none(),
+        "Go renders an in-memory default without inserting options"
+    );
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        [
+            "/telegram/bottest-token/GetChatMember",
+            "/telegram/bottest-token/GetChatMember",
+            "/telegram/bottest-token/SendMessage",
+        ]
+    );
+    assert_eq!(request_body(&requests[0])["user_id"], 9_999);
+    assert_eq!(request_body(&requests[1])["user_id"], FROM_ID);
+    let response = request_body(&requests[2]);
+    assert_eq!(
+        response["text"],
+        "好的。请在下面点击你想配置的选项进行操作吧。"
+    );
+    assert_eq!(response["reply_parameters"]["message_id"], 77);
+    let markup: Value = match &response["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+        value => value.clone(),
+    };
+    assert_eq!(
+        markup["inline_keyboard"]
+            .as_array()
+            .expect("configure keyboard")
+            .len(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(FROM_ID, false)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: false,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("disabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wire = keyboard["inline_keyboard"][1][0]["callback_data"]
+        .as_str()
+        .expect("toggle callback")
+        .to_owned();
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("enable recap callback");
+
+    assert!(
+        feature_flags::has_recap_enabled(&database, CHAT_ID, "Parity Lab")
+            .await
+            .expect("feature flag")
+    );
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("recap options")
+        .expect("first enable options");
+    assert_eq!(options.auto_recap_rates_per_day, 4);
+    assert_eq!(options.auto_recap_send_mode, 0);
+    assert!(!options.pin_auto_recap_message);
+    let queue = state
+        .raw_zset(keys::AUTO_RECAP_QUEUE_KEY)
+        .expect("automatic recap queue");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].1, encode_auto_recap_member(CHAT_ID));
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        [
+            "/telegram/bottest-token/GetChatMember",
+            "/telegram/bottest-token/GetChatMember",
+            "/telegram/bottest-token/EditMessageText",
+        ]
+    );
+    let response = request_body(&requests[2]);
+    assert_eq!(
+        response["text"],
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能已开启，开启后将会自动收集群组中的聊天记录并定时发送聊天回顾快报。"
+    );
+    let markup: Value = match &response["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+        value => value.clone(),
+    };
+    assert_eq!(
+        markup["inline_keyboard"]
+            .as_array()
+            .expect("enabled keyboard")
+            .len(),
+        9
+    );
+}
+
+#[tokio::test]
+async fn assign_private_mode_is_creator_only_and_does_not_queue() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_owner_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    feature_flags::enable_recap(&database, CHAT_ID, "supergroup", "Parity Lab")
+        .await
+        .expect("enable recap");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("disabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wire = keyboard["inline_keyboard"][3][1]["callback_data"]
+        .as_str()
+        .expect("private-mode callback")
+        .to_owned();
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("assign private mode callback");
+
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("recap options")
+        .expect("mode-only options row");
+    assert_eq!(options.auto_recap_send_mode, 1);
+    assert_eq!(
+        options.auto_recap_rates_per_day, 0,
+        "Go's mode-only create leaves the schema-default rate"
+    );
+    assert!(state.raw_zset(keys::AUTO_RECAP_QUEUE_KEY).is_none());
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let response = request_body(&requests[2]);
+    assert_eq!(
+        response["text"],
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾模式已切换为<b>私聊</b>，将会自动收集群组中的聊天记录并定时发送聊天回顾快报给通过 /subscribe_recap 命令订阅了本群组聊天回顾用户。"
+    );
+    assert_eq!(response["parse_mode"], "HTML");
+    let markup: Value = match &response["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+        value => value.clone(),
+    };
+    assert_eq!(markup["inline_keyboard"][5][2]["text"], "🔘 4 次");
+}
+
+#[tokio::test]
+async fn rate_change_rescores_one_member_even_when_recap_is_enabled() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_owner_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    feature_flags::enable_recap(&database, CHAT_ID, "supergroup", "Parity Lab")
+        .await
+        .expect("enable recap");
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("create recap options");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let member = encode_auto_recap_member(CHAT_ID);
+    state
+        .auto_recap_zadd(&member, START_MS)
+        .await
+        .expect("plant old schedule");
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("enabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wire = keyboard["inline_keyboard"][5][0]["callback_data"]
+        .as_str()
+        .expect("two-per-day callback")
+        .to_owned();
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("rate callback");
+
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("recap options")
+        .expect("recap options row");
+    assert_eq!(options.auto_recap_rates_per_day, 2);
+    let queue = state
+        .raw_zset(keys::AUTO_RECAP_QUEUE_KEY)
+        .expect("automatic recap queue");
+    assert_eq!(queue.len(), 1, "ZADD rescores the deterministic member");
+    assert_eq!(queue[0].1, member);
+    assert_ne!(queue[0].0, START_MS);
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let response = request_body(&requests[2]);
+    assert_eq!(
+        response["text"],
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建聊天回顾的频率次数已设定为 <b>2</b>，将会自动收集群组中的聊天记录并在 <b>08:00</b>，<b>20:00</b> 发送聊天回顾快报。"
+    );
+}
+
+#[tokio::test]
+async fn pin_off_preserves_go_old_options_and_recap_status_wiring_bug() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_owner_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    feature_flags::enable_recap(&database, CHAT_ID, "supergroup", "Parity Lab")
+        .await
+        .expect("enable recap");
+    recap_options::set_pin_enabled(&database, CHAT_ID)
+        .await
+        .expect("enable recap pin");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: true,
+        },
+    )
+    .await
+    .expect("enabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wire = keyboard["inline_keyboard"][7][1]["callback_data"]
+        .as_str()
+        .expect("pin-off callback")
+        .to_owned();
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("pin-off callback");
+
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("recap options")
+        .expect("recap options row");
+    assert!(!options.pin_auto_recap_message);
+    assert!(
+        feature_flags::has_recap_enabled(&database, CHAT_ID, "Parity Lab")
+            .await
+            .expect("feature flag"),
+        "pin mutation does not disable recap in storage"
+    );
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let response = request_body(&requests[2]);
+    let markup: Value = match &response["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+        value => value.clone(),
+    };
+    assert_eq!(
+        markup["inline_keyboard"]
+            .as_array()
+            .expect("bug-compatible keyboard")
+            .len(),
+        5,
+        "Go mistakenly passes pin status as recap status when rebuilding"
+    );
+    assert_eq!(
+        response["text"],
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾消息置顶功能已关闭，关闭后将不会再收集群组中的聊天记录了。"
+    );
+}
+
+#[tokio::test]
+async fn complete_checks_only_actor_then_best_effort_deletes_settings_and_command() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(FROM_ID, false)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/DeleteMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": true
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: false,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("disabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wire = keyboard["inline_keyboard"][4][0]["callback_data"]
+        .as_str()
+        .expect("complete callback")
+        .to_owned();
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("complete callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        [
+            "/telegram/bottest-token/GetChatMember",
+            "/telegram/bottest-token/DeleteMessage",
+            "/telegram/bottest-token/DeleteMessage",
+        ],
+        "complete does not recheck bot-admin status"
+    );
+    assert_eq!(request_body(&requests[1])["message_id"], 88);
+    assert_eq!(request_body(&requests[2])["message_id"], 77);
 }

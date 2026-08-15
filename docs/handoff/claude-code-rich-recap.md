@@ -33,8 +33,8 @@ subscriptions, and forwarded recap. Run `git log --oneline -12` after the
 required lock preflight to see the exact current list.
 
 The latest completed automatic-recap commit is `be73d17` (`feat: port automatic
-rich recaps`). A later local checkpoint adds the presentation half of
-`/configure_recap`:
+rich recaps`). The next signed checkpoint `f47f2dc` added the presentation half
+of `/configure_recap`:
 
 - `src/bot/handlers/recap_configure.rs` exposes `build_configure_keyboard`.
 - `tests/recap_configure_tests.rs` fixes the disabled five-row and enabled
@@ -43,6 +43,27 @@ rich recaps`). A later local checkpoint adds the presentation half of
   `fromId`.
 - `src/bot/handlers/mod.rs` exports the new module.
 - The focused keyboard test passed before the checkpoint was committed.
+
+The current checkpoint completes the production `/configure_recap` runtime:
+
+- The command checks bot-admin status first, then creator/administrator or the
+  exact Group Anonymous Bot, replies to the command, and keeps missing options
+  as an ephemeral public/4-times/no-pin view.
+- The five Go routes are registered and dispatched through opaque Redis callback
+  wires: toggle, assign mode, complete, daily rate, and pin.
+- Toggle enable creates usable first-enable options, enables the parity feature
+  flag, and queues one deterministic TimeCapsule member. Toggle disable does not
+  remove an existing member.
+- Mode is creator-only and never queues. Daily rate is creator-only and always
+  adds or rescores the deterministic member. Complete checks only the actor and
+  best-effort deletes the settings message plus original command.
+- Pin intentionally has no payload chat/actor guard and preserves Go's visible
+  bug where requested pin status is reused as recap-enabled UI state.
+- The legacy production `cfg:*` dispatcher and keyboard were removed. The old
+  Rust-only `db::recap_config` module remains for existing schema compatibility
+  and tests but has no production callsite.
+- `tests/recap_configure_tests.rs` now has seven passing command, keyboard,
+  callback, persistence, queue, deletion, and pin-quirk tests.
 
 The current automatic-recap checkpoint adds:
 
@@ -70,49 +91,26 @@ Relevant files:
 
 Latest verification before this handoff:
 
-- `cargo check` passed.
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
+- `/configure_recap` focused tests passed: 7.
 - Automatic-recap focused tests passed: worker 9, queue 11, delivery 8.
 
 ## Next required slice
 
-Finish `/configure_recap` from the pinned Go callback implementation. The exact
-keyboard and callback-allocation primitive already exists, but
-`src/bot/handlers/recap.rs` still runs the legacy `recap_configs` command and
-raw `cfg:*` callback path. Replace that runtime path with the new module, parity
-repositories, and the five registered configure routes.
+Start with a read-only pinned-Go versus Rust audit of the completed automatic
+worker and configuration runtime; do not assume the passing tests prove every
+error branch. Prioritize exact callback denial/error behavior, anonymous-origin
+exceptions, toggle-off queue retention, rate rescore while disabled, expired
+callback payloads, startup queue seeding, and production worker invocation.
+Add one RED test for each confirmed behavioral difference before modifying code.
 
-Required behavior includes the feature toggle, public/private send mode,
-2/3/4-per-day rate, pin toggle, exact Go callback payload JSON and labels,
-owner/admin gates, and completion behavior. Enabling recap and changing the
-daily rate must immediately add or rescore the deterministic TimeCapsule member.
-Disabling recap must leave an already queued member in Redis; its later disabled
-read consumes it without requeueing. Add one RED handler test before each
-vertical implementation slice.
-
-The remaining production work is the command handler plus toggle, assign-mode,
-complete, rates-per-day, and pin callbacks. Preserve these pinned details:
-
-- Toggle accepts creator, administrator, or the exact Group Anonymous Bot;
-  assign-mode, rate, and pin are creator-only; complete accepts creator,
-  administrator, or anonymous and does not recheck bot-admin status.
-- Toggle, assign-mode, rate, and complete validate callback chat and actor, with
-  the anonymous original-command exception. Pin intentionally has no such
-  payload guard.
-- Complete best-effort deletes both the settings message and its replied-to
-  command without sending a completion message.
-- Rate changes rescore even while the feature is disabled. Disable never
-  removes the existing capsule.
-- Pin rebuilds the keyboard with its requested pin status incorrectly reused as
-  recap-enabled status. This visible Go quirk must remain fixed by a test.
-- The approved ledger resolves the first-enable missing-options crash by using
-  a usable first-enable options row before queueing; do not add a process panic.
-
-After configuration is complete, perform a read-only Go/Rust parity review of
-the automatic worker, run the full verification set, scan the exact staged diff
-for secrets and personal data, then create a signed local commit. Do not push.
-The bore tunnel on port 9487 and AyuGram are available for a later live test.
+When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
+fresh structural callsite inventory to select the next non-`/smr` Telegram gap.
+Continue module by module until every in-scope Go command, middleware, callback,
+persistence side effect, Redis lifecycle, and Telegram delivery callsite has a
+Rust equivalent or a documented approved deviation. Port 9487 and AyuGram are
+available for a later live Telegram test after local verification.
 
 ## Mandatory repository rules
 
@@ -139,7 +137,9 @@ Read `AGENTS.md`, this handoff file, and
 available, read its latest messages too. Then check `.git/index.lock`, current
 branch, latest signed commits, and the unstaged/staged diff without reading any
 `.env*` file. Preserve the completed automatic-recap checkpoint and continue
-the pinned Go v1.0.0 1:1 port from the `/configure_recap` slice described above.
-Use TDD, keep edits scoped, run focused plus full Rust verification, perform a
-staged secrets/PII scan, and create signed local commits with the exact Codex
-co-author trailer. Never push unless the user explicitly authorizes that push.
+the pinned Go v1.0.0 1:1 port from the audit and next-gap procedure described
+above. Do not redo completed modules merely because their implementation is
+unfamiliar: compare production callsites and tests first. Use TDD, keep edits
+scoped, run focused plus full Rust verification, perform a staged secrets/PII
+scan, and create signed local commits with the exact Codex co-author trailer.
+Never push unless the user explicitly authorizes that push.

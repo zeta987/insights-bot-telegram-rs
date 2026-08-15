@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Me},
+    types::{CallbackQuery, Me},
 };
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::{
     bot::context::AppContext,
@@ -249,142 +249,10 @@ impl RecapHandlers {
     pub async fn handle_configure_recap(
         bot: Bot,
         msg: Message,
+        me: Me,
         ctx: Arc<AppContext>,
     ) -> ResponseResult<()> {
-        let chat_id = msg.chat.id;
-        if !msg.chat.is_group() && !msg.chat.is_supergroup() {
-            let text = ctx.i18n.t(ctx.config.locale, "config.group_only", &[]);
-            bot.send_message(chat_id, text).await?;
-            return Ok(());
-        }
-
-        // Best-effort admin check.
-        if let Some(from) = msg.from.as_ref()
-            && let Err(err) = bot.get_chat_member(chat_id, from.id).await
-        {
-            warn!("admin check skipped: {err:?}");
-        }
-
-        let cfg = match crate::db::recap_config::get_or_create_recap_config(&ctx.db.pool, chat_id.0)
-            .await
-        {
-            Ok(c) => c,
-            Err(err) => {
-                error!("load recap config failed: {err:?}");
-                let text = ctx.i18n.t(ctx.config.locale, "config.load_failed", &[]);
-                bot.send_message(chat_id, text).await?;
-                return Ok(());
-            }
-        };
-
-        let header = ctx.i18n.t(ctx.config.locale, "config.header", &[]);
-        let kb = build_configure_keyboard(&cfg, &ctx.i18n, ctx.config.locale);
-        bot.send_message(chat_id, header).reply_markup(kb).await?;
-        Ok(())
-    }
-
-    pub async fn handle_config_callback(
-        bot: Bot,
-        q: CallbackQuery,
-        ctx: Arc<AppContext>,
-    ) -> ResponseResult<()> {
-        let id = q.id.clone();
-        bot.answer_callback_query(id).await?;
-        let Some(msg) = q.message else {
-            return Ok(());
-        };
-        let chat_id = msg.chat().id;
-        let message_id = msg.id();
-        let data = q.data.clone().unwrap_or_default();
-        let parts: Vec<&str> = data.split(':').collect();
-        if parts.len() < 2 || parts[0] != "cfg" {
-            return Ok(());
-        }
-
-        // Section header — no-op
-        if parts[1] == "noop" {
-            return Ok(());
-        }
-
-        // Done — remove keyboard and show confirmation
-        if parts[1] == "done" {
-            let done_text = ctx.i18n.t(ctx.config.locale, "config.updated", &[]);
-            bot.edit_message_text(chat_id, message_id, done_text)
-                .await
-                .ok();
-            return Ok(());
-        }
-
-        // Setting change — need 3 parts: cfg:{setting}:{value}
-        if parts.len() < 3 {
-            return Ok(());
-        }
-
-        match (parts[1], parts[2]) {
-            ("enable", "on") => {
-                crate::db::recap_config::set_enabled(&ctx.db.pool, chat_id.0, true)
-                    .await
-                    .map_err(|e| error!("set enable failed: {e:?}"))
-                    .ok();
-            }
-            ("enable", "off") => {
-                crate::db::recap_config::set_enabled(&ctx.db.pool, chat_id.0, false)
-                    .await
-                    .map_err(|e| error!("set enable failed: {e:?}"))
-                    .ok();
-            }
-            ("auto", "on") => {
-                crate::db::recap_config::set_auto_recap(&ctx.db.pool, chat_id.0, true)
-                    .await
-                    .map_err(|e| error!("set auto failed: {e:?}"))
-                    .ok();
-            }
-            ("auto", "off") => {
-                crate::db::recap_config::set_auto_recap(&ctx.db.pool, chat_id.0, false)
-                    .await
-                    .map_err(|e| error!("set auto failed: {e:?}"))
-                    .ok();
-            }
-            ("freq", rate_str) => {
-                if let Ok(rate) = rate_str.parse::<i32>()
-                    && [2, 3, 4].contains(&rate)
-                {
-                    crate::db::recap_config::set_auto_recap_rates_per_day(
-                        &ctx.db.pool,
-                        chat_id.0,
-                        rate,
-                    )
-                    .await
-                    .map_err(|e| error!("set freq failed: {e:?}"))
-                    .ok();
-                }
-            }
-            ("pin", "on") => {
-                crate::db::recap_config::set_pin_auto_recap_message(&ctx.db.pool, chat_id.0, true)
-                    .await
-                    .map_err(|e| error!("set pin failed: {e:?}"))
-                    .ok();
-            }
-            ("pin", "off") => {
-                crate::db::recap_config::set_pin_auto_recap_message(&ctx.db.pool, chat_id.0, false)
-                    .await
-                    .map_err(|e| error!("set pin failed: {e:?}"))
-                    .ok();
-            }
-            _ => return Ok(()),
-        }
-
-        // Reload config and refresh keyboard in-place
-        if let Ok(new_cfg) =
-            crate::db::recap_config::get_or_create_recap_config(&ctx.db.pool, chat_id.0).await
-        {
-            let kb = build_configure_keyboard(&new_cfg, &ctx.i18n, ctx.config.locale);
-            bot.edit_message_reply_markup(chat_id, message_id)
-                .reply_markup(kb)
-                .await
-                .ok();
-        }
-        Ok(())
+        crate::bot::handlers::recap_configure::handle_configure_recap(bot, msg, me, ctx).await
     }
 
     /// Legacy callback handler that routes to appropriate handler.
@@ -393,10 +261,33 @@ impl RecapHandlers {
         q: CallbackQuery,
         ctx: Arc<AppContext>,
     ) -> ResponseResult<()> {
+        Self::handle_callback_query_inner(bot, q, None, ctx).await
+    }
+
+    pub async fn handle_callback_query_with_me(
+        bot: Bot,
+        q: CallbackQuery,
+        me: Me,
+        ctx: Arc<AppContext>,
+    ) -> ResponseResult<()> {
+        Self::handle_callback_query_inner(bot, q, Some(me), ctx).await
+    }
+
+    async fn handle_callback_query_inner(
+        bot: Bot,
+        q: CallbackQuery,
+        me: Option<Me>,
+        ctx: Arc<AppContext>,
+    ) -> ResponseResult<()> {
         let data = q.data.clone().unwrap_or_default();
 
-        if data.starts_with("cfg:") {
-            return Self::handle_config_callback(bot, q, ctx).await;
+        if crate::redis::keys::decode_callback_wire(&data).is_some_and(|(route_hash, _)| {
+            route_hash
+                == crate::redis::keys::callback_route_hash(
+                    crate::bot::handlers::recap_configure::ROUTE_NOP,
+                )
+        }) {
+            return Ok(());
         }
 
         let Some(state) = ctx.recap_state.as_deref() else {
@@ -423,6 +314,28 @@ impl RecapHandlers {
         }
         if let Err(source) = registry.bind(crate::redis::keys::ROUTE_UNSUBSCRIBE_RECAP) {
             error!(?source, "failed to bind recap unsubscribe callback route");
+            return Ok(());
+        }
+        if let Err(source) = registry.bind(crate::redis::keys::ROUTE_CONFIGURE_TOGGLE) {
+            error!(?source, "failed to bind recap toggle callback route");
+            return Ok(());
+        }
+        if let Err(source) = registry.bind(crate::redis::keys::ROUTE_CONFIGURE_ASSIGN_MODE) {
+            error!(?source, "failed to bind recap mode callback route");
+            return Ok(());
+        }
+        if let Err(source) =
+            registry.bind(crate::redis::keys::ROUTE_CONFIGURE_AUTO_RECAP_RATES_PER_DAY)
+        {
+            error!(?source, "failed to bind recap rate callback route");
+            return Ok(());
+        }
+        if let Err(source) = registry.bind(crate::redis::keys::ROUTE_CONFIGURE_PIN) {
+            error!(?source, "failed to bind recap pin callback route");
+            return Ok(());
+        }
+        if let Err(source) = registry.bind(crate::redis::keys::ROUTE_CONFIGURE_COMPLETE) {
+            error!(?source, "failed to bind recap complete callback route");
             return Ok(());
         }
         let resolution = match registry.resolve(state, &data).await {
@@ -485,6 +398,90 @@ impl RecapHandlers {
                 )
                 .await
             }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
+            } if route == crate::redis::keys::ROUTE_CONFIGURE_TOGGLE => {
+                let Some(me) = me else {
+                    error!("bot identity is unavailable for recap toggle callback");
+                    return Ok(());
+                };
+                crate::bot::handlers::recap_configure::handle_toggle_callback(
+                    bot,
+                    q,
+                    me,
+                    payload_json,
+                    ctx,
+                )
+                .await
+            }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
+            } if route == crate::redis::keys::ROUTE_CONFIGURE_ASSIGN_MODE => {
+                let Some(me) = me else {
+                    error!("bot identity is unavailable for recap mode callback");
+                    return Ok(());
+                };
+                crate::bot::handlers::recap_configure::handle_assign_mode_callback(
+                    bot,
+                    q,
+                    me,
+                    payload_json,
+                    ctx,
+                )
+                .await
+            }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
+            } if route == crate::redis::keys::ROUTE_CONFIGURE_AUTO_RECAP_RATES_PER_DAY => {
+                let Some(me) = me else {
+                    error!("bot identity is unavailable for recap rate callback");
+                    return Ok(());
+                };
+                crate::bot::handlers::recap_configure::handle_rates_callback(
+                    bot,
+                    q,
+                    me,
+                    payload_json,
+                    ctx,
+                )
+                .await
+            }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
+            } if route == crate::redis::keys::ROUTE_CONFIGURE_PIN => {
+                let Some(me) = me else {
+                    error!("bot identity is unavailable for recap pin callback");
+                    return Ok(());
+                };
+                crate::bot::handlers::recap_configure::handle_pin_callback(
+                    bot,
+                    q,
+                    me,
+                    payload_json,
+                    ctx,
+                )
+                .await
+            }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
+            } if route == crate::redis::keys::ROUTE_CONFIGURE_COMPLETE => {
+                crate::bot::handlers::recap_configure::handle_complete_callback(
+                    bot,
+                    q,
+                    payload_json,
+                )
+                .await
+            }
             crate::redis::recap_state::CallbackResolution::UnknownRoute => Ok(()),
             crate::redis::recap_state::CallbackResolution::Malformed
             | crate::redis::recap_state::CallbackResolution::MissingHandler { .. }
@@ -502,101 +499,4 @@ impl RecapHandlers {
             }
         }
     }
-}
-
-/// Build the inline keyboard for /configure_recap in Go-style grouped layout.
-fn build_configure_keyboard(
-    cfg: &crate::db::models::RecapConfig,
-    i18n: &I18n,
-    locale: Locale,
-) -> InlineKeyboardMarkup {
-    let on = i18n.t(locale, "config.on", &[]);
-    let off = i18n.t(locale, "config.off", &[]);
-
-    let selected = |label: &str| format!("● {label}");
-
-    let (enable_on, enable_off) = if cfg.enabled {
-        (selected(&on), off.clone())
-    } else {
-        (on.clone(), selected(&off))
-    };
-
-    let (auto_on, auto_off) = if cfg.auto_recap_enabled {
-        (selected(&on), off.clone())
-    } else {
-        (on.clone(), selected(&off))
-    };
-
-    let rates = cfg.auto_recap_rates_per_day;
-    let freq_2x = i18n.t(locale, "config.freq_2x", &[]);
-    let freq_3x = i18n.t(locale, "config.freq_3x", &[]);
-    let freq_4x = i18n.t(locale, "config.freq_4x", &[]);
-    let f2 = if rates == 2 {
-        selected(&freq_2x)
-    } else {
-        freq_2x
-    };
-    let f3 = if rates == 3 {
-        selected(&freq_3x)
-    } else {
-        freq_3x
-    };
-    let f4 = if rates == 4 {
-        selected(&freq_4x)
-    } else {
-        freq_4x
-    };
-
-    let (pin_on, pin_off) = if cfg.pin_auto_recap_message {
-        (selected(&on), off)
-    } else {
-        (on, selected(&off))
-    };
-
-    let done = i18n.t(locale, "config.done", &[]);
-
-    InlineKeyboardMarkup::new(vec![
-        // Section: Enabled
-        vec![InlineKeyboardButton::callback(
-            i18n.t(locale, "config.section_enabled", &[]),
-            "cfg:noop",
-        )],
-        vec![
-            InlineKeyboardButton::callback(enable_on, "cfg:enable:on"),
-            InlineKeyboardButton::callback(enable_off, "cfg:enable:off"),
-        ],
-        // Section: Auto-recap
-        vec![InlineKeyboardButton::callback(
-            i18n.t(locale, "config.section_auto", &[]),
-            "cfg:noop",
-        )],
-        vec![
-            InlineKeyboardButton::callback(auto_on, "cfg:auto:on"),
-            InlineKeyboardButton::callback(auto_off, "cfg:auto:off"),
-        ],
-        // Section: Frequency
-        vec![InlineKeyboardButton::callback(
-            i18n.t(locale, "config.section_freq", &[]),
-            "cfg:noop",
-        )],
-        vec![
-            InlineKeyboardButton::callback(f2, "cfg:freq:2"),
-            InlineKeyboardButton::callback(f3, "cfg:freq:3"),
-            InlineKeyboardButton::callback(f4, "cfg:freq:4"),
-        ],
-        // Section: Pin
-        vec![InlineKeyboardButton::callback(
-            i18n.t(locale, "config.section_pin", &[]),
-            "cfg:noop",
-        )],
-        vec![
-            InlineKeyboardButton::callback(pin_on, "cfg:pin:on"),
-            InlineKeyboardButton::callback(pin_off, "cfg:pin:off"),
-        ],
-        // Done
-        vec![InlineKeyboardButton::callback(
-            format!("✅ {done}"),
-            "cfg:done",
-        )],
-    ])
 }

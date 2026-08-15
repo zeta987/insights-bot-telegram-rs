@@ -75,7 +75,7 @@ pub fn build_dispatcher(
     );
 
     let callback_handler =
-        Update::filter_callback_query().endpoint(RecapHandlers::handle_callback_query);
+        Update::filter_callback_query().endpoint(RecapHandlers::handle_callback_query_with_me);
 
     let handler = dptree::entry()
         .branch(message_handler)
