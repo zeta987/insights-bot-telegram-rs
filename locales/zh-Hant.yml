@@ -95,3 +95,9 @@ prompts:
   sarcastic_system: "你是一位精煉的聊天記錄總結員。\n請將提供的聊天記錄，用繁體中文總結成一句話的核心內容，並在總結中恰當使用1-2個相關的emoji。\n總結應語言精煉、直擊要點。\n請直接給出總結，不要包含任何前言或解釋。"
   sarcastic_user: "以下是一段聊天記錄，請給出你的總結：\n\n聊天記錄：\"\"\"\n{chat_history}\n\"\"\"\n\n請直接給出總結，不要加任何解釋。"
   bullet_system: "你是一位精煉的聊天記錄總結員。請將提供的聊天記錄總結成要點，包含關鍵話題、決策和行動項目。\n\n要求：\n- 使用繁體中文回覆\n- 最多10個要點\n- 每個要點簡潔明瞭\n- 保留重要的用戶名和上下文\n- 每個要點末尾用方括號引用相關 msgId 編號，例如 [633577] 或 [633577][633579]；msgId 已在輸入中標記（格式 msgId:123: ...），可引用多個以覆蓋證據。"
+
+# 群組遷移通知：Go v1.0.0 只提供 en / zh-CN 語言包，沒有繁體中文版本，
+# 依 Go 的 bundle fallback 設計（預設語言為 English）改用其英文原文，
+# 不自創繁體中文譯文（chatmigrate.go:148-166）
+migration:
+  notification: "{Name} @{Username} has observed your group's upgrading to a <b>supergroup</b>, where the group ID will change. Rest assured, we've smoothly transitioned all historical data to the new group ID, while maintaining all your settings unaltered. However, due to Telegram's limitations, message IDs from before the upgrade won't match those sent after and will thus be excluded from future summaries. We regret any inconvenience caused by such migrations."

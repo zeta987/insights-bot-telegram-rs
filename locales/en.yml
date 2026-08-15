@@ -95,3 +95,7 @@ prompts:
   sarcastic_system: "You are a concise chat history summarizer.\nSummarize the provided chat history into a single-sentence core summary, using 1-2 relevant emojis.\nBe concise and get straight to the point.\nRespond directly with the summary, no preamble or explanation."
   sarcastic_user: "Here is a chat history, please provide your summary:\n\nChat history:\"\"\"\n{chat_history}\n\"\"\"\n\nPlease provide the summary directly, no explanation."
   bullet_system: "You are a concise Telegram chat recap assistant. Summarize the chat history into key points, including main topics, decisions, and action items.\n\nRequirements:\n- Respond in English\n- Maximum 10 bullet points\n- Keep each point concise\n- Preserve important usernames and context\n- Append citation brackets with msgId numbers at the end of each point, e.g., [633577] or [633577][633579]; msgId numbers are present in the input lines (format msgId:123: ...). Use multiple citations when needed."
+
+# Chat migration notifications (Go v1.0.0 chatmigrate.go:148-166)
+migration:
+  notification: "{Name} @{Username} has observed your group's upgrading to a <b>supergroup</b>, where the group ID will change. Rest assured, we've smoothly transitioned all historical data to the new group ID, while maintaining all your settings unaltered. However, due to Telegram's limitations, message IDs from before the upgrade won't match those sent after and will thus be excluded from future summaries. We regret any inconvenience caused by such migrations."

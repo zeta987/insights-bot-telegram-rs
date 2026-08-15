@@ -47,7 +47,11 @@ pub fn build_dispatcher(
                 .endpoint(recap_subscription::handle_unsubscribe_recap_command),
         );
 
-    let migration_filter = dptree::filter(|msg: Message| msg.migrate_to_chat_id().is_some())
+    // Go `OnChatMigrationFrom` (`chatmigrate.go:56-68`) fires on the **new
+    // supergroup** side, when the service message carries
+    // `migrate_from_chat_id`; the old group's own `migrate_to_chat_id`
+    // message is never the trigger.
+    let migration_filter = dptree::filter(|msg: Message| msg.migrate_from_chat_id().is_some())
         .endpoint(MigrationHandlers::handle_chat_migration);
     let left_member_filter =
         Message::filter_left_chat_member().endpoint(recap_subscription::handle_chat_member_left);
