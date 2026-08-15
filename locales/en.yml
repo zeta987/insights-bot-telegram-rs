@@ -99,3 +99,29 @@ prompts:
 # Chat migration notifications (Go v1.0.0 chatmigrate.go:148-166)
 migration:
   notification: "{Name} @{Username} has observed your group's upgrading to a <b>supergroup</b>, where the group ID will change. Rest assured, we've smoothly transitioned all historical data to the new group ID, while maintaining all your settings unaltered. However, due to Telegram's limitations, message IDs from before the upgrade won't match those sent after and will thus be excluded from future summaries. We regret any inconvenience caused by such migrations."
+
+# Bot-join welcome message (Go v1.0.0 welcome.go:137-184, key
+# modules.telegram.welcome.messageNormalGroup)
+welcome:
+  message_normal_group: |
+    🤗 Welcome to @{Username}!
+
+    - Use /smr@{Username} <code>article link</code> for article readings.
+
+    - For chat history summaries, please assign me as admin (all permissions can be omitted) using a <b>non-anonymous identity</b> (recommended, otherwise permission validation may fail. Then, start /configure_recap@{Username} to configure chat recap.
+
+    - Removing my admin status is a simple way to delete all bot-recorded messages, automatically purging bot data unless modifications have been made by another maintainer.
+
+    ⚠️ Your group isn't a supergroup yet; message reference linking will not work.
+
+    To enable message reference linking:
+
+    - Temporarily switch your group to public, then revert to private.
+    - Upgrade to a supergroup by other means.
+
+    Questions?
+
+    1. Consult /help@{Username} for command details.
+    2. Visit our <a href="https://github.com/nekomeowww/insights-bot">GitHub</a> for support.
+
+    Enjoy your experience!

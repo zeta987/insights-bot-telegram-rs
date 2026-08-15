@@ -81,8 +81,10 @@ pub fn build_dispatcher(
     let callback_handler =
         Update::filter_callback_query().endpoint(RecapHandlers::handle_callback_query_with_me);
 
-    // Go `welcome.go:57` OnMyChatMember: only the bot's own `left` status
-    // triggers the five-step cleanup; the handler filters the status itself.
+    // Go `welcome.go:57-184` OnMyChatMember: the bot's own `left` status
+    // triggers the five-step cleanup, and the bot's own `member` status
+    // triggers the first-join welcome (best-effort Telegram reply); the
+    // handler filters the status itself.
     let my_chat_member_handler =
         Update::filter_my_chat_member().endpoint(chat_member::handle_my_chat_member);
 
