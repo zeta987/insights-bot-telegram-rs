@@ -366,3 +366,18 @@ fn config_rejects_invalid_telegram_api_endpoints() {
         assert!(err.to_string().contains("TELEGRAM_BOT_API_ENDPOINT"));
     }
 }
+
+#[test]
+fn config_rejects_telegram_api_endpoints_with_query_or_fragment() {
+    for raw in [
+        "https://telegram.example/?x=1",
+        "https://telegram.example/#frag",
+    ] {
+        let mut values = required_values();
+        values.push(("TELEGRAM_BOT_API_ENDPOINT", raw));
+        let err = config(&values)
+            .err()
+            .expect("endpoint must not contain a query or fragment");
+        assert!(err.to_string().contains("TELEGRAM_BOT_API_ENDPOINT"));
+    }
+}

@@ -15,6 +15,11 @@ use insights_bot_telegram_rs::{
             BeforeSendHook, PlainRecapSendRequest, RecapDeliveryConfig, RecapDeliveryError,
             RecapDeliverySender, RichRecapSendRequest, TelegramRecapSender, send_rich_recap_parts,
         },
+        rich_recap::{
+            CondensedExecutionTrace, ConditionalModelExecutionTrace, GenerationModelExecutionTrace,
+            RecapExecutionTrace, RichRecapSummaryConfig, build_rich_recap_summary,
+            compose_rich_recap_messages,
+        },
         telegram_rich_message::{TelegramResponseParameters, TelegramRichMessageError},
     },
 };
@@ -413,6 +418,95 @@ async fn plain_fallback_splits_at_4096_utf16_units_and_replies_to_the_first() {
     );
     assert_eq!(plain[0].reply_to_message_id, 0);
     assert_eq!(plain[1].reply_to_message_id, messages[0].id.0);
+}
+
+/// End-to-end pipeline: `build_rich_recap_summary` → `compose_rich_recap_messages`
+/// → `send_rich_recap_parts`, mirroring Go's
+/// `TestRichRecapSummaryFallsBackToCompleteSegmentedPlainText`
+/// (insights-bot-go `internal/services/recapdelivery/delivery_test.go:300-364`).
+#[tokio::test]
+async fn full_pipeline_falls_back_to_complete_segmented_plain_text() {
+    let sender = FakeSender::with_errors(
+        [api_error(400, "Bad Request: invalid rich message markdown")],
+        [],
+    );
+    let markup = keyboard();
+    let condensed = CondensedExecutionTrace {
+        generation: GenerationModelExecutionTrace {
+            primary_model: "condensedModel".into(),
+            ..Default::default()
+        },
+        check: ConditionalModelExecutionTrace {
+            generation: GenerationModelExecutionTrace {
+                primary_model: "checkModel".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    };
+    let recap = RecapExecutionTrace {
+        generation: GenerationModelExecutionTrace {
+            primary_model: "detailModel".into(),
+            ..Default::default()
+        },
+    };
+    let summary = build_rich_recap_summary(&RichRecapSummaryConfig {
+        title: "TG BOT 測試",
+        hours: 1,
+        initiator_name: "TestUser(測試...)",
+        initiator_user_id: 42,
+        condensed_summary: "### 測試摘要\n\n- **觸發方式**：/recap",
+        condensed_trace: Some(&condensed),
+        recap_trace: Some(&recap),
+        ..Default::default()
+    });
+    let detail = format!(
+        "## 討論內容\n\n{}\n\n參考 [1](https://t.me/c/123/45)。",
+        "這是需要分段的詳細內容。".repeat(500)
+    );
+    let parts = compose_rich_recap_messages(&summary, &[detail]);
+
+    let messages = send_rich_recap_parts(
+        &sender,
+        RecapDeliveryConfig {
+            chat_id: 123,
+            parts,
+            reply_to_message_id: 9,
+            reply_markup: Some(markup.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("plain fallback should complete delivery");
+
+    assert_eq!(sender.rich_requests().len(), 1);
+    let plain = sender.plain_requests();
+    assert!(plain.len() >= 2, "the oversized detail must split");
+    assert_eq!(messages.len(), plain.len());
+
+    for (index, request) in plain.iter().enumerate() {
+        assert!(request.text.encode_utf16().count() <= 4096);
+        if index == 0 {
+            assert_eq!(request.reply_markup, Some(markup.clone()));
+            assert_eq!(request.reply_to_message_id, 9);
+        } else {
+            assert!(request.reply_markup.is_none());
+            assert_eq!(request.reply_to_message_id, messages[0].id.0);
+        }
+    }
+
+    let joined = plain
+        .iter()
+        .map(|request| request.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("【TG BOT 測試】聊天回顧"));
+    assert!(joined.contains("用戶 TestUser(測試...) 發起 1 小時總結"));
+    assert!(!joined.contains("tg://user"));
+    assert!(joined.contains("模型資訊"));
+    assert!(joined.contains("Check：checkModel"));
+    assert!(!joined.contains("> "));
+    assert!(joined.contains("1 (https://t.me/c/123/45)"));
 }
 
 #[tokio::test]

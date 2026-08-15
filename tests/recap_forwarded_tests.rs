@@ -1003,3 +1003,81 @@ async fn administrator_group_cancel_requires_the_own_bot_mention() {
         ]
     );
 }
+
+#[tokio::test]
+async fn mentioned_administrator_group_cancel_without_an_active_session_reports_already_cancelled()
+{
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "user": {
+                    "id": 9_999,
+                    "is_bot": true,
+                    "first_name": "Test Bot",
+                    "username": "TestBot"
+                },
+                "status": "administrator",
+                "can_be_edited": false,
+                "can_manage_chat": true,
+                "can_delete_messages": true,
+                "can_manage_video_chats": true,
+                "can_restrict_members": true,
+                "can_promote_members": true,
+                "can_change_info": true,
+                "can_invite_users": true,
+                "can_post_stories": true,
+                "can_edit_stories": true,
+                "can_delete_stories": true,
+                "is_anonymous": false
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let none_active = "已经没有正在进行的操作了";
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .and(body_partial_json(serde_json::json!({"text": none_active})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_message_result(830, none_active)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state.clone()).await;
+
+    SystemHandlers::handle_cancel(
+        context.config.telegram.bot(),
+        group_command("/cancel@TestBot"),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("mentioned administrator-group cancel with no active session");
+    assert!(
+        !state
+            .forwarded_active(USER_ID)
+            .await
+            .expect("still inactive")
+    );
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let replies = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/SendMessage"))
+        .map(request_body)
+        .collect::<Vec<_>>();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies[0]["reply_parameters"]["message_id"],
+        COMMAND_MESSAGE_ID
+    );
+}

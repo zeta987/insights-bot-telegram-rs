@@ -13,8 +13,8 @@ use std::sync::Arc;
 use insights_bot_telegram_rs::redis::{
     keys::{self, StartContextDomain},
     recap_state::{
-        CallbackResolution, CallbackRouteRegistry, InMemoryRecapStateStore, RecapStateStore,
-        TestClock,
+        CallbackResolution, CallbackRouteRegistry, InMemoryRecapStateStore, ManualRecapRateResult,
+        RecapStateStore, TestClock,
     },
 };
 
@@ -1189,4 +1189,103 @@ async fn redis_backend_matches_the_in_memory_double() {
         ])
         .await
         .expect("cleanup");
+}
+
+/// An "orphaned" batch — the ZSET was written by `append_forwarded` but the
+/// control key was never set (or already expired independently) — must not
+/// be treated as cancellable. `src/redis/recap_state.rs:1014-1024` gates
+/// `cancel_forwarded` on `forwarded_active`, so a missing control key must
+/// report `false` and leave the batch key untouched.
+#[tokio::test]
+async fn cancel_forwarded_leaves_an_orphaned_batch_untouched() {
+    let Some(store) = support::redis_fixture::connect().await else {
+        eprintln!("skipping: no loopback Redis on 127.0.0.1:6379");
+        return;
+    };
+
+    let actor = support::redis_fixture::unique_actor_id();
+
+    // Append directly, without `start_forwarded`, so the batch key exists
+    // while the control key never gets written.
+    store
+        .append_forwarded(actor, 500, r#"{"t":"orphan"}"#)
+        .await
+        .expect("append orphan member");
+    assert!(
+        !store.forwarded_active(actor).await.expect("active check"),
+        "the control key must stay absent"
+    );
+
+    assert!(
+        !store.cancel_forwarded(actor).await.expect("cancel orphan"),
+        "cancel_forwarded must report false for an orphaned batch"
+    );
+
+    assert_eq!(
+        store.forwarded_batch(actor).await.expect("batch retained"),
+        vec![r#"{"t":"orphan"}"#.to_owned()],
+        "the orphaned batch itself must not be deleted"
+    );
+
+    store
+        .delete_keys(&[keys::forwarded_batch_key(actor)])
+        .await
+        .expect("cleanup");
+}
+
+/// `check_manual_recap_rate` against real Redis, matching the InMemory
+/// double's GET/TTL/SET-EX semantics: a first call on a missing key reports
+/// the `-2` TTL sentinel, later calls report the key's real remaining TTL,
+/// and calls at or past the configured rate are rejected without mutating
+/// the stored counter.
+#[tokio::test]
+async fn check_manual_recap_rate_matches_the_in_memory_double_against_real_redis() {
+    let Some(store) = support::redis_fixture::connect().await else {
+        eprintln!("skipping: no loopback Redis on 127.0.0.1:6379");
+        return;
+    };
+
+    let chat_id = support::redis_fixture::unique_actor_id();
+    let rate_key = keys::manual_recap_rate_key(chat_id);
+
+    // First call: no key yet. Redis' TTL command on a missing key returns
+    // -2, matching the InMemory double's sentinel for "no entry".
+    let first = store
+        .check_manual_recap_rate(chat_id, 2, 60)
+        .await
+        .expect("first call");
+    assert_eq!(
+        first,
+        ManualRecapRateResult {
+            counted_rate: 1,
+            ttl_seconds: -2,
+            allowed: true,
+        }
+    );
+    assert_eq!(
+        store.ttl_seconds(&rate_key).await.expect("ttl after first"),
+        Some(60)
+    );
+
+    // Second call: the counter increments and the TTL observed at the start
+    // of the call now reflects the key's real remaining lifetime.
+    let second = store
+        .check_manual_recap_rate(chat_id, 2, 60)
+        .await
+        .expect("second call");
+    assert_eq!(second.counted_rate, 2);
+    assert!(second.allowed);
+    assert!((0..=60).contains(&second.ttl_seconds));
+
+    // Third call reaches the configured rate and must be rejected without
+    // bumping the stored counter.
+    let third = store
+        .check_manual_recap_rate(chat_id, 2, 60)
+        .await
+        .expect("third call");
+    assert_eq!(third.counted_rate, 2);
+    assert!(!third.allowed);
+    assert!((0..=60).contains(&third.ttl_seconds));
+
+    store.delete_keys(&[rate_key]).await.expect("cleanup");
 }
