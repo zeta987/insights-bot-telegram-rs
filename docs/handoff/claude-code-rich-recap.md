@@ -168,6 +168,31 @@ existing cleanup:
   recap log text with the row retained) with zero Telegram requests, and that
   a banned update changes nothing.
 
+A seven-module read-only parity audit (manual recap, subscriptions, forwarded
+recap, feedback callbacks, middleware/lifecycle, Rich delivery/transport,
+autorecap/startup/health/config) then compared every non-`/smr` Go Telegram
+callsite against Rust. Subscriptions, forwarded recap, feedback callbacks,
+Rich delivery, and `/cancel` came back with zero missing behavior and zero
+deviations. The four checkpoints that followed close everything the audit
+confirmed as an in-scope Telegram gap:
+
+- `test: cover subscription gate and failure paths` adds the seven previously
+  untested `/subscribe_recap`, `/unsubscribe_recap`, and `/start` continuation
+  branches using SQLite `RAISE(ABORT)` trigger injection.
+- `fix: yield during auto recap restore retry` replaces a
+  `std::thread::sleep` inside the Redis zpop restore loop with
+  `tokio::time::sleep`, matching Go's cooperative goroutine park.
+- `fix: match go select-hour callback failures` removes the port's only
+  `answer_callback_query` call (Go never answers callback queries anywhere)
+  and splits the select-hour payload errors: a bind failure keeps the
+  generation-failure text while an out-of-set hour sends Go's framework
+  default `发生了一些错误，请稍后再试` as a plain reply-or-message.
+- `fix: match go chat migration trigger and notice` moves the migration
+  filter to the new supergroup's `migrate_from_chat_id` service message and
+  adds Go's best-effort HTML migration notification with locale entries. Go
+  registers every locale bundle under the zh-CN tag; that upstream i18n bug
+  is documented, not reproduced.
+
 Latest verification before this handoff:
 
 - `cargo fmt --check` reports only the known `src/db/recap_config.rs` and
@@ -177,6 +202,9 @@ Latest verification before this handoff:
 - Full `cargo test` passed.
 - `/configure_recap` focused tests passed: 26.
 - Bot-left chat member focused tests passed: 2.
+- Chat migration focused tests passed: 3.
+- Manual recap focused tests passed: 19.
+- Subscription focused tests passed: 31.
 - Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
 
 ## Deferred parity decisions
@@ -197,21 +225,50 @@ deliberately deferred; get an explicit decision before acting on either:
   unreachable. Surfacing them changes a shared signature used by the worker
   and the startup seed.
 
+The parity audit added these further deferred items; none is an in-scope
+Telegram callsite, so none was acted on without a decision:
+
+- `set_my_commands` runs on every Rust startup (`src/bot/mod.rs:36-61`); Go
+  v1.0.0 never calls `setMyCommands`. Removing it is a visible UX change.
+- A Telegraph client is still constructed and held on `AppContext`
+  (`src/services/telegraph.rs`, `src/main.rs`) although Go v1.0.0 removed the
+  Telegraph integration. Cleanup candidate.
+- Startup order is inverted versus Go (Rust arms the auto-recap poller, then
+  spawns health without waiting for the bind, then starts the dispatcher; Go
+  binds health, starts the dispatcher, then starts the digger) and the health
+  port differs: Go hardcodes `7069`, Rust `3000`, with no env override.
+- Go's `/health` is a composite checker (`telegram_bot`, digger, auto-recap
+  readiness as JSON); Rust's is a bare `SELECT 1`.
+- Rust has no SIGINT/SIGTERM graceful shutdown; Go stops every component in
+  reverse order via fx lifecycle hooks.
+- `REDIS_CLIENT_CACHE_ENABLED` is parsed but unwired; the `redis` crate has
+  no client-side-cache seam, so this likely becomes a documented deviation.
+- `services/rate_limit.rs::CommandRateLimiter` is dead scaffolding: built in
+  `main.rs`, stored on `AppContext`, never checked by the router.
+- Kept Rust hardenings, recorded as intentional: fail-fast
+  `TELEGRAM_BOT_API_ENDPOINT` validation, the missing-`error_code` HTTP-status
+  fallback in the Rich transport, and fail-fast `REDIS_PORT` parsing.
+
 ## Next required slice
 
-The bot-left production wiring is complete, and an earlier top-level
-dispatcher inventory found no other missing in-scope recap registration:
-recap commands, start/cancel continuations, all nine callback routes,
-ordinary `left_chat_member`, migration, and now `my_chat_member` are wired in
-Rust. Go's channel-post and summarization-retry registrations belong to
-excluded `/smr`.
+The last confirmed in-scope Telegram gap is the bot-join welcome branch
+(`welcome.go:57-74,137-184`): a `my_chat_member` transition to exactly
+`member` should run the `HasJoinedGroupsBefore` guard, set the group language
+from the adder's `language_code`, and send the HTML welcome message
+best-effort. The DB primitives (`has_joined_before`, `set_language`,
+`find_language`) already exist unwired in `src/db/feature_flags.rs`.
 
-Use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a fresh structural
-callsite inventory to select the next non-`/smr` Telegram gap. Continue
-module by module until every in-scope Go command, middleware, callback,
-persistence side effect, Redis lifecycle, and Telegram delivery callsite has a
-Rust equivalent or a documented approved deviation. Port 9487 and AyuGram are
-available for a later live Telegram test after local verification.
+After that, the remaining work is the audit's test-backfill pool (largest
+first): the autorecap production wiring (`spawn_autorecap`,
+`handle_auto_recap_capsule`, `generate_and_deliver_auto_recap`, the concrete
+startup seeder, the double-requeue assertion), the dispatcher fallback and
+expired-feedback-payload end-to-end cases, the live-Redis
+`check_manual_recap_rate` and orphan-batch cancel cases, the duplicate
+reaction-count and recap-table un-toggle cases, the endpoint query/fragment
+rejection branch, and one composition-through-delivery integration test.
+Then resolve the deferred parity decisions above with the user. Port 9487 and
+AyuGram are available for a later live Telegram test after local
+verification.
 
 ## Mandatory repository rules
 
@@ -240,8 +297,8 @@ available, read its latest messages too. Then check `.git/index.lock`, current
 branch, latest signed commits, and the unstaged/staged diff without reading any
 `.env*` file. Preserve the completed automatic-recap checkpoint and continue
 the pinned Go v1.0.0 1:1 port from the audit and next-gap procedure described
-above. Begin with the fresh non-`/smr` callsite inventory under `Next required
-slice`; do not broadly refactor existing handlers. Do not redo
+above. Begin with the bot-join welcome slice under `Next required slice`; do not
+broadly refactor existing handlers. Do not redo
 completed modules merely because their implementation is
 unfamiliar: compare production callsites and tests first. Use TDD, keep edits
 scoped, run focused plus full Rust verification, perform a staged secrets/PII
