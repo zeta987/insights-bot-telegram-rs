@@ -205,6 +205,12 @@ fn anonymous_configure_callback(wire: &str) -> CallbackQuery {
     serde_json::from_value(value).expect("anonymous configure callback")
 }
 
+fn anonymous_origin_configure_callback(wire: &str) -> CallbackQuery {
+    let mut value = serde_json::to_value(configure_callback(wire)).expect("serialize callback");
+    value["message"]["reply_to_message"]["from"] = group_anonymous_bot_json();
+    serde_json::from_value(value).expect("anonymous-origin configure callback")
+}
+
 fn configure_callback_with_markup(wire: &str, markup: &Value) -> CallbackQuery {
     let mut value = serde_json::to_value(configure_callback(wire)).expect("serialize callback");
     value["message"]["reply_markup"] = markup.clone();
@@ -1286,6 +1292,60 @@ async fn group_anonymous_bot_is_looked_up_before_every_admin_exception() {
         3,
         "Go queries membership before applying each GroupAnonymousBot exception"
     );
+}
+
+#[tokio::test]
+async fn anonymous_original_command_bypasses_complete_payload_actor_binding() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_owner_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/DeleteMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": true
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: GROUP_ANONYMOUS_BOT_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("anonymous-origin keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let complete = keyboard["inline_keyboard"][8][0]["callback_data"]
+        .as_str()
+        .expect("complete wire");
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        anonymous_origin_configure_callback(complete),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("anonymous-origin complete callback");
 }
 
 #[tokio::test]

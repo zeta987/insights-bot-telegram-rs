@@ -87,11 +87,13 @@ success-only audit originally missed:
 - Toggle, mode, rate, and pin callbacks now perform Go's group/supergroup gate
   after the bot-admin lookup and before actor lookup or persistence. Crafted
   private callbacks receive the exact HTML error and retain their keyboard.
+- A callback from an ordinary owner may bypass the payload actor binding when
+  the original `/configure_recap` command came from GroupAnonymousBot, matching
+  Go's reply-to-message exception; the actor membership lookup still occurs.
 - The toggle integration now proves disable leaves the existing deterministic
   queue member untouched, and the rate integration proves a disabled chat is
   still rescored without being enabled.
-- Five RED-to-GREEN transport tests raise the focused configuration total to
-  twelve.
+- The focused configuration suite now contains thirteen tests.
 
 The current automatic-recap checkpoint adds:
 
@@ -103,6 +105,8 @@ The current automatic-recap checkpoint adds:
   dereference.
 - Startup seeding uses Go's two phases: load or create options for every enabled
   chat first, then queue only the successful chats in a second pass.
+- Production startup is wired from `main` and retains Go's order: synchronous
+  seed, optional nonzero direct test capsule task, then the one-second poller.
 - Rich recap generation from the parity history/log repositories, public-first
   delivery, duplicate subscriber fan-out, shared five-per-second send limiter,
   subscriber unsubscribe keyboards, partial-send persistence, pin replacement,
@@ -123,7 +127,7 @@ Latest verification before this handoff:
 
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
-- `/configure_recap` focused tests passed: 12.
+- `/configure_recap` focused tests passed: 13.
 - Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
 
 ## Next required slice
@@ -133,9 +137,56 @@ worker and configuration runtime; passing tests do not prove every error branch.
 The ordinary-member, creator-only, GroupAnonymousBot actor lookup, expired
 payload, toggle-off queue retention, disabled-rate-rescore, and two-phase
 startup seed and callback group-only branches are complete. Next verify
-production worker invocation and direct test-capsule startup behavior, then
-check original-message anonymous-origin exceptions plus the remaining Bot API
-failure branches.
+the remaining configuration failure branches. The confirmed next RED matrix is:
+
+- Go selects stage-specific text for toggle options lookup, toggle enable or
+  disable, rate persistence, pin persistence, and keyboard Redis failure;
+  Rust currently collapses those paths into `APPLY_CONFIG_ERROR` or
+  `APPLY_PIN_ERROR`. Compare Go `callback_query.go:149-205,469-519,583-630`
+  with Rust `recap_configure.rs:385-433,623-677,743-787`.
+- Add a closed-pool database fixture plus a `RecapStateStore` whose
+  `put_callback` fails, then assert exact `EditMessageText.text`, parse mode,
+  and retained markup for each stage before changing production constants.
+- Exact Go text groups are: toggle options/keyboard
+  `暂时无法配置聊天记录回顾功能，请稍后再试！`; toggle mutation uses the header plus
+  `聊天记录回顾功能开启失败，请稍后再试！` or its `关闭失败` variant; mode
+  feature lookup uses the header plus `聊天记录回顾模式设定失败，请稍后再试！`,
+  while mode options/keyboard use the same temporary-unavailable text; every
+  post-permission rate failure uses the header plus
+  `每天自动创建回顾频率次数设定失败，请稍后再试！`; pin options/keyboard use
+  `暂时无法配置聊天记录回顾消息置顶功能，请稍后再试！`, while pin mutation uses
+  the header plus its `开启失败` or `关闭失败` variant.
+- Several pinned-Go failures call `WithEdit(c.Update.Message)` instead of the
+  callback message. This usually produces no callback edit; treat it as an
+  explicit compatibility decision and test it before changing Rust's current
+  callback-message edit target.
+- The safe `find_one_or_create` handling for missing toggle/pin options is an
+  approved bounded Rust replacement for pinned Go's nil-pointer crash and must
+  remain documented rather than reintroducing a process panic.
+
+After this matrix, use the parity ledger to select the next non-`/smr` Telegram
+gap. The next confirmed production wiring gap is bot-left cleanup:
+
+- Go registers `OnMyChatMember` in `welcome/welcome.go:56-65` and, only when
+  `new_chat_member.status == left`, calls its best-effort five-step cleanup.
+- Rust already implements the exact independent cleanup order in
+  `src/db/chat_cleanup.rs` and tests the repository side effects, but
+  `src/bot/router.rs` has no `Update::filter_my_chat_member()` branch, so the
+  production function is unreachable.
+- Add a router endpoint that ignores non-left statuses and invokes
+  `prune_chat_data_after_bot_left(db, update.chat.id)` without a Telegram reply.
+  Write a dispatcher-level test for a left update plus a non-left control; keep
+  the existing ordinary `left_chat_member` subscriber-removal branch separate.
+- This checkout uses teloxide 0.14. Its concrete seam is
+  `Update::filter_my_chat_member()` yielding `ChatMemberUpdated`; the predicate
+  can call `update.new_chat_member.is_left()`, and the chat ID is
+  `update.chat.id.0`. In teloxide-core 0.11.2, `is_left()` matches only the
+  `Left` variant and excludes `Banned`, preserving Go's exact `status == left`;
+  use a banned update as the non-left control.
+- A fresh top-level dispatcher inventory found no other missing in-scope recap
+  registration: recap commands, start/cancel continuations, all nine callback
+  routes, ordinary `left_chat_member`, and migration are wired in Rust. Go's
+  channel-post and summarization-retry registrations belong to excluded `/smr`.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
 fresh structural callsite inventory to select the next non-`/smr` Telegram gap.
@@ -170,7 +221,9 @@ available, read its latest messages too. Then check `.git/index.lock`, current
 branch, latest signed commits, and the unstaged/staged diff without reading any
 `.env*` file. Preserve the completed automatic-recap checkpoint and continue
 the pinned Go v1.0.0 1:1 port from the audit and next-gap procedure described
-above. Do not redo completed modules merely because their implementation is
+above. Begin with the stage-specific configuration failure RED matrix under
+`Next required slice`; do not broadly refactor its handlers. Do not redo
+completed modules merely because their implementation is
 unfamiliar: compare production callsites and tests first. Use TDD, keep edits
 scoped, run focused plus full Rust verification, perform a staged secrets/PII
 scan, and create signed local commits with the exact Codex co-author trailer.
