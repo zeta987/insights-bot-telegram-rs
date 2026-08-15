@@ -1397,3 +1397,485 @@ fn production_manual_callback_has_no_legacy_telegraph_path() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Audit #15-19: `handle_callback_query_with_me` dispatcher fallback and
+// feedback-route edge cases.
+// ---------------------------------------------------------------------------
+
+const GO_GENERIC_INVALID_ACTION_TEXT: &str =
+    "抱歉，因为操作无效，此操作无法进行，请重新发起操作后再试。";
+
+/// #15a: a wire that is not exactly two `;`-delimited segments resolves to
+/// `CallbackResolution::Malformed`, which the dispatcher's fallback arm
+/// (`recap.rs:486-499`) answers with a single generic edit.
+#[tokio::test]
+async fn dispatcher_malformed_wire_sends_the_go_generic_invalid_action_text() {
+    let server = MockServer::start().await;
+    Mock::given(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 202,
+                "date": 1_710_000_002,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"},
+                "text": "Rich recap"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        feedback_callback_query("not-a-two-segment-wire"),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("malformed wire callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(requests.len(), 1, "only the fallback edit is sent");
+    let body = request_body(&requests[0]);
+    assert_eq!(body["message_id"], 202);
+    assert_eq!(body["text"], GO_GENERIC_INVALID_ACTION_TEXT);
+}
+
+/// #15b: a well-formed wire whose route hash matches no registered route
+/// resolves to `CallbackResolution::UnknownRoute`, which the dispatcher
+/// answers silently (`recap.rs:485`).
+#[tokio::test]
+async fn dispatcher_unknown_route_hash_makes_zero_telegram_calls() {
+    let server = MockServer::start().await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let context = command_context(&server, database, state).await;
+    let wire = "0000000000000000;1111111111111111";
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        feedback_callback_query(wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("unknown route callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        0,
+        "Go's dispatcher answers nothing for an unresolved route hash"
+    );
+}
+
+/// #15c: a wire built directly with `callback_wire_value` (bypassing
+/// `put_callback`) carries a route hash for a route the dispatcher always
+/// binds, but an action hash whose payload was never stored. `resolve()`
+/// still returns `Dispatch { payload_json: "" }` (`recap_state.rs:251-259`,
+/// "leftover Dispatch"), and every currently bound route already has its own
+/// `if route == ...` arm above the generic fallback
+/// (`recap.rs:348-484`), so this never reaches the generic
+/// "操作无效" text: it runs `handle_unsubscribe_callback` directly, which
+/// reports its own bind-failure text on the empty payload.
+#[tokio::test]
+async fn dispatcher_leftover_dispatch_reaches_the_bound_handler_not_the_generic_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 202,
+                "date": 1_710_000_002,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"},
+                "text": "Rich recap"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let context = command_context(&server, database, state).await;
+    let wire = keys::callback_wire_value(keys::ROUTE_UNSUBSCRIBE_RECAP, "payload-never-stored");
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        feedback_callback_query(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("leftover dispatch callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the bound handler runs directly instead of the generic fallback arm"
+    );
+    let body = request_body(&requests[0]);
+    assert_ne!(
+        body["text"], GO_GENERIC_INVALID_ACTION_TEXT,
+        "a leftover Dispatch for a bound route never reaches recap.rs's generic fallback text"
+    );
+    assert_eq!(
+        body["text"], "取消订阅时出现了问题，请稍后再试！",
+        "empty payload_json reaches handle_unsubscribe_callback's own bind-failure branch"
+    );
+}
+
+/// #16: a select-hour-style feedback payload that outlives the 86,400-second
+/// callback TTL (`keys::CALLBACK_PAYLOAD_TTL_SECONDS`) resolves to `Dispatch`
+/// with an empty `payload_json` (`InMemoryRecapStateStore`'s `now >=
+/// expires_at` rule). `handle_feedback_reaction_callback` fails to bind that
+/// empty string and returns silently before any Telegram call or DB write.
+#[tokio::test]
+async fn expired_smr_feedback_payload_is_a_silent_no_op() {
+    let server = MockServer::start().await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let clock = Arc::new(TestClock::new(START_MS));
+    let state = Arc::new(InMemoryRecapStateStore::new(clock.clone() as Arc<dyn Clock>));
+    let payload = format!(r#"{{"chatId":{CHAT_ID},"logId":"{LOG_ID}","type":"up_vote"}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_SMR_SUMMARIZATION_FEEDBACK_REACT, &payload)
+        .await
+        .expect("store smr feedback callback");
+    clock.advance_ms(86_400_000);
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        feedback_callback_query(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("expired smr feedback callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        0,
+        "an expired payload never reaches Telegram"
+    );
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::Summarizations,
+        CHAT_ID,
+        Uuid::parse_str(LOG_ID).expect("log UUID"),
+    )
+    .await
+    .expect("summarization counts");
+    assert_eq!(
+        counts,
+        ReactionCounts::default(),
+        "no reaction row is written for an expired payload"
+    );
+}
+
+/// #16, legacy counterpart: same expiry rule through
+/// `handle_recap_feedback_reaction_callback` and the `ChatHistoriesRecaps`
+/// table.
+#[tokio::test]
+async fn expired_legacy_recap_feedback_payload_is_a_silent_no_op() {
+    let server = MockServer::start().await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let clock = Arc::new(TestClock::new(START_MS));
+    let state = Arc::new(InMemoryRecapStateStore::new(clock.clone() as Arc<dyn Clock>));
+    let payload = format!(r#"{{"chatId":{CHAT_ID},"logId":"{LOG_ID}","type":"up_vote"}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_RECAP_FEEDBACK_REACT, &payload)
+        .await
+        .expect("store legacy recap feedback callback");
+    let markup = serde_json::json!({
+        "inline_keyboard": [[{"text": "👍", "callback_data": wire}]]
+    });
+    clock.advance_ms(86_400_000);
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        legacy_feedback_callback_query(&wire, &markup),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("expired legacy recap feedback callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        0,
+        "an expired payload never reaches Telegram"
+    );
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::ChatHistoriesRecaps,
+        CHAT_ID,
+        Uuid::parse_str(LOG_ID).expect("log UUID"),
+    )
+    .await
+    .expect("recap reaction counts");
+    assert_eq!(
+        counts,
+        ReactionCounts::default(),
+        "no reaction row is written for an expired payload"
+    );
+}
+
+/// #17: Go's `react()` runs three independent, non-transactional statements
+/// (`db/feedback.rs`'s own module doc), so a race can leave two physical rows
+/// for the same `(chat_id, log_id, user_id, type)` tuple. `counts()` loads
+/// every row without deduplicating, so it must report both.
+#[tokio::test]
+async fn counts_reflects_every_physical_duplicate_row_from_a_non_transactional_race() {
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let log_id = Uuid::parse_str(LOG_ID).expect("log UUID");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO feedback_summarizations_reactions
+                (id, chat_id, log_id, user_id, \"type\", created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(CHAT_ID)
+        .bind(LOG_ID)
+        .bind(42_i64)
+        .bind("up_vote")
+        .bind(now)
+        .bind(now)
+        .execute(&database.pool)
+        .await
+        .expect("seed a duplicate reaction row");
+    }
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::Summarizations,
+        CHAT_ID,
+        log_id,
+    )
+    .await
+    .expect("summarization counts");
+
+    assert_eq!(
+        counts.up_votes, 2,
+        "counts() loads every physical row, so a non-transactional race that leaves two \
+         rows is double-counted exactly as Go's in-memory filter would double-count them"
+    );
+}
+
+/// #18: clicking the same legacy vote button twice hits `feedback::react`'s
+/// `delete_typed` early-return path (`db/feedback.rs:228-237`) the second
+/// time, deleting the reaction row instead of inserting another one. The
+/// markup is still edited on both clicks.
+#[tokio::test]
+async fn legacy_recap_feedback_un_votes_and_still_edits_markup_on_the_second_click() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageReplyMarkup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 204,
+                "date": 1_710_000_004,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"},
+                "text": "Legacy recap"
+            }
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let payload = format!(r#"{{"chatId":{CHAT_ID},"logId":"{LOG_ID}","type":"up_vote"}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_RECAP_FEEDBACK_REACT, &payload)
+        .await
+        .expect("legacy recap callback");
+    let markup = serde_json::json!({
+        "inline_keyboard": [[{"text": "👍", "callback_data": wire}]]
+    });
+    let context = command_context(&server, database.clone(), state).await;
+    let log_id = Uuid::parse_str(LOG_ID).expect("log UUID");
+
+    for expected_count in [1, 0] {
+        RecapHandlers::handle_callback_query_with_me(
+            context.config.telegram.bot(),
+            legacy_feedback_callback_query(&wire, &markup),
+            bot_me(),
+            context.clone(),
+        )
+        .await
+        .expect("legacy recap feedback callback");
+
+        let counts = insights_bot_telegram_rs::db::feedback::counts(
+            &database,
+            insights_bot_telegram_rs::db::feedback::ReactionTable::ChatHistoriesRecaps,
+            CHAT_ID,
+            log_id,
+        )
+        .await
+        .expect("recap reaction counts");
+        assert_eq!(
+            counts.up_votes, expected_count,
+            "the second click of the same vote must un-vote, not add a second row"
+        );
+    }
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        2,
+        "the markup is edited on both the vote and the un-vote click"
+    );
+}
+
+/// #19a: `handle_recap_feedback_reaction_callback` runs `feedback::react`
+/// before it ever inspects `reply_markup` (`recap_manual.rs:547-595`), so a
+/// callback message with no `reply_markup` at all still records the
+/// reaction; only the trailing `edit_message_reply_markup` call is skipped
+/// by the early `let Some(mut current_markup) = ... else { return Ok(()) }`.
+#[tokio::test]
+async fn legacy_recap_feedback_writes_the_reaction_but_skips_the_edit_without_reply_markup() {
+    let server = MockServer::start().await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let payload = format!(r#"{{"chatId":{CHAT_ID},"logId":"{LOG_ID}","type":"up_vote"}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_RECAP_FEEDBACK_REACT, &payload)
+        .await
+        .expect("legacy recap callback");
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        feedback_callback_query(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("legacy recap feedback callback without reply markup");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        0,
+        "with no reply_markup to edit, the handler bails out before any Telegram call"
+    );
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::ChatHistoriesRecaps,
+        CHAT_ID,
+        Uuid::parse_str(LOG_ID).expect("log UUID"),
+    )
+    .await
+    .expect("recap reaction counts");
+    assert_eq!(
+        counts.up_votes, 1,
+        "the reaction row is written even though there is no markup left to edit"
+    );
+}
+
+/// #19b: when `reply_markup` is present but no row's `callback_data` equals
+/// the clicked wire, the row-replacement loop
+/// (`recap_manual.rs:600-609`) leaves every row untouched, yet the
+/// unconditional `edit_message_reply_markup` call below it still runs.
+#[tokio::test]
+async fn legacy_recap_feedback_edits_the_markup_unchanged_when_no_row_matches_the_click() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageReplyMarkup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 204,
+                "date": 1_710_000_004,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"},
+                "text": "Legacy recap"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let payload = format!(r#"{{"chatId":{CHAT_ID},"logId":"{LOG_ID}","type":"up_vote"}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_RECAP_FEEDBACK_REACT, &payload)
+        .await
+        .expect("legacy recap callback");
+    let markup = serde_json::json!({
+        "inline_keyboard": [[{"text": "keep", "callback_data": "an-unrelated-row"}]]
+    });
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        legacy_feedback_callback_query(&wire, &markup),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("legacy recap feedback callback with a non-matching row");
+
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(
+        requests.len(),
+        1,
+        "the unconditional edit still runs even though no row matched the clicked wire"
+    );
+    let edit = request_body(&requests[0]);
+    let edited_markup: Value = match &edit["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup string"),
+        value => value.clone(),
+    };
+    assert_eq!(
+        edited_markup["inline_keyboard"], markup["inline_keyboard"],
+        "with no matching row the loop leaves every row exactly as it was"
+    );
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::ChatHistoriesRecaps,
+        CHAT_ID,
+        Uuid::parse_str(LOG_ID).expect("log UUID"),
+    )
+    .await
+    .expect("recap reaction counts");
+    assert_eq!(
+        counts.up_votes, 1,
+        "the reaction is still recorded even though no button visibly changes"
+    );
+}
