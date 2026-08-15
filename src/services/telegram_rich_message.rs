@@ -1,4 +1,4 @@
-//! Raw Telegram `sendRichMessage` transport used by Go v1.0.0 recaps.
+//! Raw Telegram transport used by Go v1.0.0 Rich recap delivery.
 
 use std::fmt;
 
@@ -26,6 +26,16 @@ pub struct RichMessageRequest<'a> {
     pub disable_notification: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlainMessageRequest<'a> {
+    pub chat_id: i64,
+    pub text: &'a str,
+    pub reply_to_message_id: i32,
+    pub reply_markup: Option<&'a InlineKeyboardMarkup>,
+    pub disable_notification: bool,
+    pub allow_sending_without_reply: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Deserialize)]
 pub struct TelegramResponseParameters {
     #[serde(default)]
@@ -49,11 +59,7 @@ pub enum TelegramRichMessageError {
 impl fmt::Display for TelegramRichMessageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Api {
-                code, description, ..
-            } => {
-                write!(formatter, "Telegram API error {code}: {description}")
-            }
+            Self::Api { description, .. } => formatter.write_str(description),
             Self::RequestEncoding => {
                 formatter.write_str("Telegram Rich Message request is invalid")
             }
@@ -70,7 +76,8 @@ impl std::error::Error for TelegramRichMessageError {}
 #[derive(Clone)]
 pub struct TelegramRichMessageClient {
     http: reqwest::Client,
-    endpoint: Url,
+    rich_endpoint: Url,
+    plain_endpoint: Url,
 }
 
 impl TelegramRichMessageClient {
@@ -78,7 +85,8 @@ impl TelegramRichMessageClient {
     pub fn new(http: reqwest::Client, config: &TelegramConfig) -> Self {
         Self {
             http,
-            endpoint: rich_message_endpoint(config),
+            rich_endpoint: telegram_method_endpoint(config, "sendRichMessage"),
+            plain_endpoint: telegram_method_endpoint(config, "sendMessage"),
         }
     }
 
@@ -115,10 +123,52 @@ impl TelegramRichMessageClient {
             form.push(("disable_notification", "true".to_owned()));
         }
 
+        self.send_form(&self.rich_endpoint, &form).await
+    }
+
+    pub async fn send_plain(
+        &self,
+        request: PlainMessageRequest<'_>,
+    ) -> Result<Message, TelegramRichMessageError> {
+        let mut form = Vec::with_capacity(6);
+        if request.chat_id != 0 {
+            form.push(("chat_id", request.chat_id.to_string()));
+        }
+        if !request.text.is_empty() {
+            form.push(("text", request.text.to_owned()));
+        }
+        if request.reply_to_message_id != 0 {
+            form.push((
+                "reply_to_message_id",
+                request.reply_to_message_id.to_string(),
+            ));
+        }
+        if let Some(reply_markup) = request.reply_markup {
+            form.push((
+                "reply_markup",
+                serde_json::to_string(reply_markup)
+                    .map_err(|_| TelegramRichMessageError::RequestEncoding)?,
+            ));
+        }
+        if request.disable_notification {
+            form.push(("disable_notification", "true".to_owned()));
+        }
+        if request.allow_sending_without_reply {
+            form.push(("allow_sending_without_reply", "true".to_owned()));
+        }
+
+        self.send_form(&self.plain_endpoint, &form).await
+    }
+
+    async fn send_form(
+        &self,
+        endpoint: &Url,
+        form: &[(&str, String)],
+    ) -> Result<Message, TelegramRichMessageError> {
         let response = self
             .http
-            .post(self.endpoint.clone())
-            .form(&form)
+            .post(endpoint.clone())
+            .form(form)
             .send()
             .await
             .map_err(|_| TelegramRichMessageError::Transport)?;
@@ -167,7 +217,7 @@ struct TelegramResponse {
     parameters: Option<TelegramResponseParameters>,
 }
 
-fn rich_message_endpoint(config: &TelegramConfig) -> Url {
+fn telegram_method_endpoint(config: &TelegramConfig, method: &str) -> Url {
     let mut endpoint = Url::parse(config.api_base())
         .expect("Telegram API endpoint was validated during configuration loading");
     endpoint
@@ -175,7 +225,7 @@ fn rich_message_endpoint(config: &TelegramConfig) -> Url {
         .expect("HTTP(S) Telegram endpoints can contain path segments")
         .pop_if_empty()
         .push(&format!("bot{}", config.bot_token))
-        .push("sendRichMessage");
+        .push(method);
     endpoint
 }
 
