@@ -498,7 +498,7 @@ async fn configure_command_checks_bot_and_actor_and_keeps_missing_options_epheme
 }
 
 #[tokio::test]
-async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
+async fn toggle_on_queues_and_toggle_off_retains_the_existing_member() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/telegram/bottest-token/GetChatMember"))
@@ -506,7 +506,7 @@ async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
@@ -515,13 +515,13 @@ async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
         .respond_with(
             ResponseTemplate::new(200).set_body_json(telegram_administrator_result(FROM_ID, false)),
         )
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/telegram/bottest-token/EditMessageText"))
         .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -544,17 +544,21 @@ async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
     .await
     .expect("disabled configure keyboard");
     let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
-    let wire = keyboard["inline_keyboard"][1][0]["callback_data"]
+    let toggle_on_wire = keyboard["inline_keyboard"][1][0]["callback_data"]
         .as_str()
         .expect("toggle callback")
+        .to_owned();
+    let toggle_off_wire = keyboard["inline_keyboard"][1][1]["callback_data"]
+        .as_str()
+        .expect("toggle off callback")
         .to_owned();
     let context = command_context(&server, database.clone(), state.clone()).await;
 
     RecapHandlers::handle_callback_query_with_me(
         context.config.telegram.bot(),
-        configure_callback(&wire),
+        configure_callback(&toggle_on_wire),
         bot_me(),
-        context,
+        context.clone(),
     )
     .await
     .expect("enable recap callback");
@@ -576,6 +580,7 @@ async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
         .expect("automatic recap queue");
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].1, encode_auto_recap_member(CHAT_ID));
+    let queued_before_disable = queue.clone();
 
     let requests = server.received_requests().await.expect("Telegram requests");
     assert_eq!(
@@ -608,6 +613,25 @@ async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
             .expect("enabled keyboard")
             .len(),
         9
+    );
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&toggle_off_wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("disable recap callback");
+    assert!(
+        !feature_flags::has_recap_enabled(&database, CHAT_ID, "Parity Lab")
+            .await
+            .expect("disabled feature flag")
+    );
+    assert_eq!(
+        state.raw_zset(keys::AUTO_RECAP_QUEUE_KEY),
+        Some(queued_before_disable),
+        "Go leaves the old member for the worker to consume after disable"
     );
 }
 
@@ -699,7 +723,7 @@ async fn assign_private_mode_is_creator_only_and_does_not_queue() {
 }
 
 #[tokio::test]
-async fn rate_change_rescores_one_member_even_when_recap_is_enabled() {
+async fn rate_change_rescores_one_member_even_when_recap_is_disabled() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/telegram/bottest-token/GetChatMember"))
@@ -726,9 +750,6 @@ async fn rate_change_rescores_one_member_even_when_recap_is_enabled() {
 
     let fixture = SchemaFixture::new();
     let database = fixture.bootstrap_database().await;
-    feature_flags::enable_recap(&database, CHAT_ID, "supergroup", "Parity Lab")
-        .await
-        .expect("enable recap");
     recap_options::find_one_or_create(&database, CHAT_ID)
         .await
         .expect("create recap options");
@@ -780,8 +801,25 @@ async fn rate_change_rescores_one_member_even_when_recap_is_enabled() {
     assert_eq!(queue.len(), 1, "ZADD rescores the deterministic member");
     assert_eq!(queue[0].1, member);
     assert_ne!(queue[0].0, START_MS);
+    assert!(
+        !feature_flags::has_recap_enabled(&database, CHAT_ID, "Parity Lab")
+            .await
+            .expect("disabled feature flag"),
+        "rate changes do not enable recap"
+    );
     let requests = server.received_requests().await.expect("Telegram requests");
     let response = request_body(&requests[2]);
+    let markup: Value = match &response["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+        value => value.clone(),
+    };
+    assert_eq!(
+        markup["inline_keyboard"]
+            .as_array()
+            .expect("disabled keyboard")
+            .len(),
+        5
+    );
     assert_eq!(
         response["text"],
         "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建聊天回顾的频率次数已设定为 <b>2</b>，将会自动收集群组中的聊天记录并在 <b>08:00</b>，<b>20:00</b> 发送聊天回顾快报。"

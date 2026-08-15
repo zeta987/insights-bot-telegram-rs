@@ -84,6 +84,9 @@ success-only audit originally missed:
   permission errors use `HTML`.
 - An expired configure callback receives the fixed plain error edit and the
   existing inline keyboard is sent back unchanged.
+- The toggle integration now proves disable leaves the existing deterministic
+  queue member untouched, and the rate integration proves a disabled chat is
+  still rescored without being enabled.
 - Four RED-to-GREEN transport tests raise the focused configuration total to
   eleven.
 
@@ -122,12 +125,14 @@ Latest verification before this handoff:
 
 Continue the read-only pinned-Go versus Rust audit of the completed automatic
 worker and configuration runtime; passing tests do not prove every error branch.
-The ordinary-member, creator-only, and GroupAnonymousBot actor lookup branches
-are complete. Next check original-message anonymous-origin exceptions,
-toggle-off queue retention, rate rescore while disabled, startup queue seeding,
-production worker invocation, and the callback group-only and remaining Bot API
-failure branches. Add one RED test for each confirmed behavioral difference
-before modifying code.
+The ordinary-member, creator-only, GroupAnonymousBot actor lookup, expired
+payload, toggle-off queue retention, and disabled-rate-rescore branches are
+complete. The next confirmed difference is startup queue seeding order: pinned
+Go first creates or loads options for every enabled chat, then performs queue
+writes in a second loop; Rust currently creates and queues one chat at a time.
+Add an observable RED ordering test, then port the two-phase loop. Afterwards
+check original-message anonymous-origin exceptions, production worker
+invocation, and the callback group-only and remaining Bot API failure branches.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
 fresh structural callsite inventory to select the next non-`/smr` Telegram gap.
