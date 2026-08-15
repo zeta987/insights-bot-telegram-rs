@@ -5,4 +5,5 @@ pub mod openai;
 pub mod prompts;
 pub mod rate_limit;
 pub mod recap;
+pub mod rich_recap;
 pub mod telegraph;
