@@ -6,4 +6,5 @@ pub mod prompts;
 pub mod rate_limit;
 pub mod recap;
 pub mod rich_recap;
+pub mod telegram_rich_message;
 pub mod telegraph;
