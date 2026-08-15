@@ -976,6 +976,24 @@ async fn drain_delete_later_deletes_the_key_before_returning_the_pairs() {
 }
 
 #[tokio::test]
+async fn delivery_drain_returns_messages_and_post_delete_status_together() {
+    let (store, _) = store();
+    store
+        .push_delete_later(ACTOR, SAMPLE_CHAT_ID, 41)
+        .await
+        .expect("push delete-later message");
+
+    let drained = store
+        .drain_delete_later_for_delivery(ACTOR)
+        .await
+        .expect("delivery drain");
+
+    assert_eq!(drained.messages, vec![(SAMPLE_CHAT_ID, 41)]);
+    assert!(drained.delete_error.is_none());
+    assert!(store.raw_list(&keys::delete_later_key(ACTOR)).is_none());
+}
+
+#[tokio::test]
 async fn drain_delete_later_filters_malformed_members_but_still_clears_the_key() {
     let (store, _clock) = store();
     store.push_delete_later(ACTOR, -100, 1).await.expect("push");

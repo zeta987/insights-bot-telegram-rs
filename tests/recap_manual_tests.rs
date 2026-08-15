@@ -30,7 +30,7 @@ use insights_bot_telegram_rs::{
 };
 use serde_json::Value;
 use support::sqlite_fixture::SchemaFixture;
-use teloxide::types::{CallbackQuery, Message};
+use teloxide::types::{CallbackQuery, Me, Message};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -64,6 +64,19 @@ fn command_message() -> Message {
         "text": "/recap"
     }))
     .expect("valid Telegram command fixture")
+}
+
+fn bot_me() -> Me {
+    serde_json::from_value(serde_json::json!({
+        "id": 9_999,
+        "is_bot": true,
+        "first_name": "Test Bot",
+        "username": "TestBot",
+        "can_join_groups": true,
+        "can_read_all_group_messages": true,
+        "supports_inline_queries": false
+    }))
+    .expect("valid Telegram bot identity")
 }
 
 async fn command_context(
@@ -187,6 +200,53 @@ fn feedback_callback_query(wire: &str) -> CallbackQuery {
         "data": wire
     }))
     .expect("valid feedback callback fixture")
+}
+
+fn legacy_feedback_callback_query(wire: &str, markup: &Value) -> CallbackQuery {
+    serde_json::from_value(serde_json::json!({
+        "id": "legacy-recap-feedback-callback",
+        "from": {
+            "id": 42,
+            "is_bot": false,
+            "first_name": "Ada",
+            "username": "ada"
+        },
+        "message": {
+            "message_id": 204,
+            "date": 1_710_000_004,
+            "chat": {
+                "id": CHAT_ID,
+                "type": "supergroup",
+                "title": "Parity Lab"
+            },
+            "text": "Legacy recap",
+            "reply_markup": markup
+        },
+        "chat_instance": "legacy-recap-chat-instance",
+        "data": wire
+    }))
+    .expect("valid legacy feedback callback fixture")
+}
+
+fn private_feedback_callback_query(wire: &str) -> CallbackQuery {
+    serde_json::from_value(serde_json::json!({
+        "id": "private-manual-feedback-callback",
+        "from": {
+            "id": 42,
+            "is_bot": false,
+            "first_name": "Ada",
+            "username": "ada"
+        },
+        "message": {
+            "message_id": 203,
+            "date": 1_710_000_003,
+            "chat": {"id": 42, "type": "private", "first_name": "Ada"},
+            "text": "Private Rich recap"
+        },
+        "chat_instance": "private-manual-chat-instance",
+        "data": wire
+    }))
+    .expect("valid private feedback callback fixture")
 }
 
 fn completion_response(model: &str, content: &str) -> Value {
@@ -651,6 +711,143 @@ async fn vote_callback_toggles_the_summarization_table_and_only_edits_markup() {
 }
 
 #[tokio::test]
+async fn legacy_recap_feedback_route_updates_recap_table_and_only_clicked_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageReplyMarkup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 204,
+                "date": 1_710_000_004,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"},
+                "text": "Legacy recap"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let payload = format!(r#"{{"chatId":{CHAT_ID},"logId":"{LOG_ID}","type":"up_vote"}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_RECAP_FEEDBACK_REACT, &payload)
+        .await
+        .expect("legacy recap callback");
+    let markup = serde_json::json!({
+        "inline_keyboard": [
+            [{"text": "👍", "callback_data": wire}],
+            [{"text": "keep", "callback_data": "keep-this-row"}]
+        ]
+    });
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    RecapHandlers::handle_callback_query(
+        context.config.telegram.bot(),
+        legacy_feedback_callback_query(&wire, &markup),
+        context,
+    )
+    .await
+    .expect("legacy recap feedback callback");
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::ChatHistoriesRecaps,
+        CHAT_ID,
+        Uuid::parse_str(LOG_ID).expect("log UUID"),
+    )
+    .await
+    .expect("recap reaction counts");
+    assert_eq!(counts.up_votes, 1);
+
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(
+        requests.len(),
+        1,
+        "Go sends no callback answer or text edit"
+    );
+    let edit = request_body(&requests[0]);
+    let edited_markup: Value = match &edit["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup string"),
+        value => value.clone(),
+    };
+    assert_eq!(edited_markup["inline_keyboard"][0][0]["text"], "👍 1");
+    assert_eq!(
+        edited_markup["inline_keyboard"][1],
+        markup["inline_keyboard"][1]
+    );
+    for button in edited_markup["inline_keyboard"][0]
+        .as_array()
+        .expect("rebuilt vote row")
+    {
+        let rebuilt_wire = button["callback_data"].as_str().expect("callback wire");
+        let (route_hash, _) =
+            keys::decode_callback_wire(rebuilt_wire).expect("opaque callback wire");
+        assert_eq!(
+            route_hash,
+            keys::callback_route_hash(keys::ROUTE_SMR_SUMMARIZATION_FEEDBACK_REACT),
+            "Go rebuilds legacy recap buttons onto the smr compatibility route"
+        );
+    }
+}
+
+#[tokio::test]
+async fn private_vote_callback_preserves_go_source_group_edit_destination() {
+    let server = MockServer::start().await;
+    Mock::given(path("/telegram/bottest-token/EditMessageReplyMarkup"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 203,
+                "date": 1_710_000_003,
+                "chat": {"id": 42, "type": "private", "first_name": "Ada"},
+                "text": "Private Rich recap"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let keyboard = build_vote_keyboard(state.as_ref(), CHAT_ID, LOG_ID, ReactionCounts::default())
+        .await
+        .expect("vote keyboard");
+    let json = serde_json::to_value(&keyboard).expect("keyboard JSON");
+    let wire = json["inline_keyboard"][0][0]["callback_data"]
+        .as_str()
+        .expect("up-vote callback");
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query(
+        context.config.telegram.bot(),
+        private_feedback_callback_query(wire),
+        context,
+    )
+    .await
+    .expect("private feedback callback");
+
+    let counts = insights_bot_telegram_rs::db::feedback::counts(
+        &database,
+        insights_bot_telegram_rs::db::feedback::ReactionTable::Summarizations,
+        CHAT_ID,
+        Uuid::parse_str(LOG_ID).expect("log UUID"),
+    )
+    .await
+    .expect("source-group reaction counts");
+    assert_eq!(counts.up_votes, 1);
+    let requests = server.received_requests().await.expect("Telegram request");
+    let edit = request_body(&requests[0]);
+    assert_eq!(edit["chat_id"], CHAT_ID);
+    assert_eq!(edit["message_id"], 203);
+}
+
+#[tokio::test]
 async fn vote_callback_canonicalizes_a_parseable_uuid_before_rebuilding_buttons() {
     let server = MockServer::start().await;
     Mock::given(path("/telegram/bottest-token/EditMessageReplyMarkup"))
@@ -748,9 +945,14 @@ async fn public_recap_command_checks_go_flags_and_replies_with_opaque_selector()
     ));
     let context = command_context(&server, database, state.clone()).await;
 
-    RecapHandlers::handle_recap(context.config.telegram.bot(), command_message(), context)
-        .await
-        .expect("public /recap command");
+    RecapHandlers::handle_recap(
+        context.config.telegram.bot(),
+        command_message(),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("public /recap command");
 
     let requests = server.received_requests().await.expect("Telegram requests");
     assert_eq!(requests.len(), 1);
@@ -809,9 +1011,14 @@ async fn denied_public_recap_stops_before_allocating_any_callback() {
         .expect("occupy rate counter");
     let context = command_context(&server, database, state.clone()).await;
 
-    RecapHandlers::handle_recap(context.config.telegram.bot(), command_message(), context)
-        .await
-        .expect("rate-denied /recap command");
+    RecapHandlers::handle_recap(
+        context.config.telegram.bot(),
+        command_message(),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("rate-denied /recap command");
 
     assert_eq!(
         state.keys(),

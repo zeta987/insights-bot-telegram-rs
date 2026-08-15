@@ -66,23 +66,38 @@ fn default_config(chat_id: i64) -> RecapConfig {
 #[test]
 fn command_surface_only_lists_supported_commands() {
     let descriptions = Command::descriptions().to_string();
-    for supported in ["/start", "/help", "/cancel", "/recap", "/configure_recap"] {
+    for supported in [
+        "/start",
+        "/help",
+        "/cancel",
+        "/recap",
+        "/configure_recap",
+        "/subscribe_recap",
+        "/unsubscribe_recap",
+    ] {
         assert!(
             descriptions.contains(supported),
             "missing supported command {supported}"
         );
     }
 
-    for removed in [
-        "/subscribe_recap",
-        "/unsubscribe_recap",
-        "/recap_forwarded_start",
-        "/recap_forwarded",
-    ] {
+    for removed in ["/recap_forwarded_start", "/recap_forwarded"] {
         assert!(
             !descriptions.contains(removed),
             "removed command {removed} should not be listed"
         );
+    }
+}
+
+#[test]
+fn start_command_preserves_the_deep_link_argument_for_handler_validation() {
+    match Command::parse("/start token extra", "TestBot").expect("parse /start") {
+        Command::Start(arguments) => assert_eq!(arguments, "token extra"),
+        command => panic!("unexpected command: {command:?}"),
+    }
+    match Command::parse("/start", "TestBot").expect("parse bare /start") {
+        Command::Start(arguments) => assert!(arguments.is_empty()),
+        command => panic!("unexpected command: {command:?}"),
     }
 }
 

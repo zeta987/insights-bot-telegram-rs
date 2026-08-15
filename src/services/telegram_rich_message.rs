@@ -30,6 +30,7 @@ pub struct RichMessageRequest<'a> {
 pub struct PlainMessageRequest<'a> {
     pub chat_id: i64,
     pub text: &'a str,
+    pub parse_mode: Option<&'a str>,
     pub reply_to_message_id: i32,
     pub reply_markup: Option<&'a InlineKeyboardMarkup>,
     pub disable_notification: bool,
@@ -130,12 +131,15 @@ impl TelegramRichMessageClient {
         &self,
         request: PlainMessageRequest<'_>,
     ) -> Result<Message, TelegramRichMessageError> {
-        let mut form = Vec::with_capacity(6);
+        let mut form = Vec::with_capacity(7);
         if request.chat_id != 0 {
             form.push(("chat_id", request.chat_id.to_string()));
         }
         if !request.text.is_empty() {
             form.push(("text", request.text.to_owned()));
+        }
+        if let Some(parse_mode) = request.parse_mode {
+            form.push(("parse_mode", parse_mode.to_owned()));
         }
         if request.reply_to_message_id != 0 {
             form.push((

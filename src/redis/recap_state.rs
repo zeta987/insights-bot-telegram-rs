@@ -30,6 +30,15 @@ pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
 }
 
+/// Delete-later members plus a Redis `DEL` failure that occurred afterwards.
+///
+/// Go attempts Telegram deletions even when the Redis key deletion failed, and
+/// only reports that failure after iterating every member.
+pub struct DeleteLaterDrain {
+    pub messages: Vec<(i64, i32)>,
+    pub delete_error: Option<anyhow::Error>,
+}
+
 /// Wall-clock time source used in production.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -124,6 +133,14 @@ pub trait RecapStateStore: Send + Sync {
 
     /// Clear the delete-later list and return its well-formed members.
     async fn drain_delete_later(&self, user_id: i64) -> Result<Vec<(i64, i32)>>;
+
+    /// Return members even when clearing their Redis key failed afterwards.
+    async fn drain_delete_later_for_delivery(&self, user_id: i64) -> Result<DeleteLaterDrain> {
+        Ok(DeleteLaterDrain {
+            messages: self.drain_delete_later(user_id).await?,
+            delete_error: None,
+        })
+    }
 }
 
 /// Result of Go's manual-recap command rate check.
@@ -750,6 +767,32 @@ impl RedisRecapStateStore {
             .map_err(|error| redacted("EXPIRE", &error))?;
         Ok(())
     }
+
+    async fn drain_delete_later_status(&self, user_id: i64) -> Result<DeleteLaterDrain> {
+        let key = keys::delete_later_key(user_id);
+        let mut connection = self.connection();
+        let members: Vec<String> = ::redis::cmd("LRANGE")
+            .arg(&key)
+            .arg(0_i64)
+            .arg(-1_i64)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("LRANGE", &error))?;
+        if members.is_empty() {
+            return Ok(DeleteLaterDrain {
+                messages: Vec::new(),
+                delete_error: None,
+            });
+        }
+        let delete_error = self.delete(&key).await.err();
+        Ok(DeleteLaterDrain {
+            messages: members
+                .iter()
+                .filter_map(|raw| keys::parse_delete_later_member(raw))
+                .collect(),
+            delete_error,
+        })
+    }
 }
 
 #[async_trait]
@@ -925,24 +968,14 @@ impl RecapStateStore for RedisRecapStateStore {
     }
 
     async fn drain_delete_later(&self, user_id: i64) -> Result<Vec<(i64, i32)>> {
-        let key = keys::delete_later_key(user_id);
-        let mut connection = self.connection();
-        let members: Vec<String> = ::redis::cmd("LRANGE")
-            .arg(&key)
-            .arg(0_i64)
-            .arg(-1_i64)
-            .query_async(&mut connection)
-            .await
-            .map_err(|error| redacted("LRANGE", &error))?;
-        if members.is_empty() {
-            // Go returns before issuing the delete when the list is empty.
-            return Ok(Vec::new());
+        let drained = self.drain_delete_later_status(user_id).await?;
+        if let Some(delete_error) = drained.delete_error {
+            return Err(delete_error);
         }
-        // Clear first; the Telegram deletions afterwards are best effort.
-        self.delete(&key).await?;
-        Ok(members
-            .iter()
-            .filter_map(|raw| keys::parse_delete_later_member(raw))
-            .collect())
+        Ok(drained.messages)
+    }
+
+    async fn drain_delete_later_for_delivery(&self, user_id: i64) -> Result<DeleteLaterDrain> {
+        self.drain_delete_later_status(user_id).await
     }
 }

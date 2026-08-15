@@ -10,6 +10,8 @@ system:
     /cancel - 取消當前操作
     /recap - 生成聊天回顧
     /configure_recap - 配置回顧設定
+    /subscribe_recap - 訂閱定時聊天回顧
+    /unsubscribe_recap - 取消訂閱定時聊天回顧
   cancel: "操作已取消。"
 
 # 回顧相關訊息

@@ -5,7 +5,10 @@ use teloxide::{RequestError, dispatching::DefaultKey, dptree, prelude::*};
 use crate::bot::{
     commands::Command,
     context::AppContext,
-    handlers::{migration::MigrationHandlers, recap::RecapHandlers, system::SystemHandlers},
+    handlers::{
+        migration::MigrationHandlers, recap::RecapHandlers, recap_subscription,
+        system::SystemHandlers,
+    },
     middleware,
 };
 
@@ -15,16 +18,26 @@ pub fn build_dispatcher(
 ) -> Dispatcher<Bot, RequestError, DefaultKey> {
     let commands = dptree::entry()
         .filter_command::<Command>()
-        .branch(dptree::case![Command::Start].endpoint(SystemHandlers::handle_start))
+        .branch(dptree::case![Command::Start(arguments)].endpoint(SystemHandlers::handle_start))
         .branch(dptree::case![Command::Help].endpoint(SystemHandlers::handle_help))
         .branch(dptree::case![Command::Cancel].endpoint(SystemHandlers::handle_cancel))
         .branch(dptree::case![Command::Recap].endpoint(RecapHandlers::handle_recap))
         .branch(
             dptree::case![Command::ConfigureRecap].endpoint(RecapHandlers::handle_configure_recap),
+        )
+        .branch(
+            dptree::case![Command::SubscribeRecap]
+                .endpoint(recap_subscription::handle_subscribe_recap_command),
+        )
+        .branch(
+            dptree::case![Command::UnsubscribeRecap]
+                .endpoint(recap_subscription::handle_unsubscribe_recap_command),
         );
 
     let migration_filter = dptree::filter(|msg: Message| msg.migrate_to_chat_id().is_some())
         .endpoint(MigrationHandlers::handle_chat_migration);
+    let left_member_filter =
+        Message::filter_left_chat_member().endpoint(recap_subscription::handle_chat_member_left);
 
     // Message handler: record ALL messages first, then try commands.
     //
@@ -37,6 +50,8 @@ pub fn build_dispatcher(
         })
         // Catch migration events before command parsing
         .branch(migration_filter)
+        // A service message removes one physical subscriber row for the member.
+        .branch(left_member_filter)
         // Then try to match commands
         .branch(commands);
 

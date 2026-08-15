@@ -40,6 +40,8 @@ async fn register_commands(bot: &Bot) -> Result<()> {
         BotCommand::new("cancel", "Cancel current operation"),
         BotCommand::new("recap", "Generate chat recap"),
         BotCommand::new("configure_recap", "Configure recap settings"),
+        BotCommand::new("subscribe_recap", "订阅当前群组的定时聊天回顾"),
+        BotCommand::new("unsubscribe_recap", "取消订阅当前群组的定时聊天回顾"),
     ];
 
     bot.set_my_commands(commands)

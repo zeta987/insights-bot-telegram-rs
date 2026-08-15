@@ -10,6 +10,8 @@ system:
     /cancel - Cancel current operation
     /recap - Generate chat recap
     /configure_recap - Configure recap settings
+    /subscribe_recap - Subscribe to scheduled chat recaps
+    /unsubscribe_recap - Unsubscribe from scheduled chat recaps
   cancel: "Operation cancelled."
 
 # Recap related messages

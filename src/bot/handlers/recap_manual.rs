@@ -6,8 +6,8 @@ use std::sync::Arc;
 use teloxide::{
     prelude::*,
     types::{
-        CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MessageId, ParseMode,
-        ReplyParameters,
+        CallbackQuery, InlineKeyboardButton, InlineKeyboardButtonKind, InlineKeyboardMarkup, Me,
+        MessageId, ParseMode, ReplyParameters,
     },
 };
 use tracing::{error, info, warn};
@@ -65,7 +65,7 @@ struct FeedbackRecapReactionActionData {
     reaction_type: String,
 }
 
-fn to_go_json<T>(value: &T) -> Result<String>
+pub(crate) fn to_go_json<T>(value: &T) -> Result<String>
 where
     T: Serialize,
 {
@@ -177,6 +177,7 @@ pub fn insufficient_histories_message(hours: i64, recap_mode: i64) -> String {
 pub async fn handle_public_recap_command(
     bot: Bot,
     message: Message,
+    me: Me,
     context: Arc<AppContext>,
 ) -> ResponseResult<()> {
     let chat_id = message.chat.id;
@@ -226,13 +227,17 @@ pub async fn handle_public_recap_command(
         }
     };
 
-    // The private-subscription branch is wired by the following Task 12
-    // section. Until then this function remains the public-mode implementation.
-    let recap_mode = options
+    let send_mode = options
         .as_ref()
         .and_then(|option| option.send_mode())
-        .unwrap_or(AutoRecapSendMode::Publicly)
-        .as_stored();
+        .unwrap_or(AutoRecapSendMode::Publicly);
+    if send_mode == AutoRecapSendMode::OnlyPrivateSubscriptions {
+        return crate::bot::handlers::recap_subscription::handle_private_recap_command(
+            &bot, &message, &me, &context,
+        )
+        .await;
+    }
+    let recap_mode = AUTO_RECAP_SEND_MODE_PUBLICLY;
     let per_seconds = recap_options::manual_rate_per_seconds(
         options.as_ref(),
         context.config.manual_recap_rate_per_seconds,
@@ -455,6 +460,129 @@ pub async fn handle_feedback_reaction_callback(
     Ok(())
 }
 
+/// Handle Go's legacy chat-history recap feedback route.
+///
+/// The handler deliberately rebuilds the clicked row onto the `smr` route,
+/// matching Go's current button factory while preserving every other row.
+pub async fn handle_recap_feedback_reaction_callback(
+    bot: Bot,
+    callback: CallbackQuery,
+    payload_json: String,
+    context: Arc<AppContext>,
+) -> ResponseResult<()> {
+    let Some(message) = callback.message.as_ref() else {
+        return Ok(());
+    };
+    let message_id = message.id();
+    let data: FeedbackRecapReactionActionData = match serde_json::from_str(&payload_json) {
+        Ok(data) => data,
+        Err(source) => {
+            error!(
+                ?source,
+                "failed to bind legacy recap feedback callback payload"
+            );
+            return Ok(());
+        }
+    };
+    let log_id = match Uuid::parse_str(&data.log_id) {
+        Ok(log_id) => log_id,
+        Err(source) => {
+            error!(
+                ?source,
+                "failed to parse legacy recap feedback log identifier"
+            );
+            return Ok(());
+        }
+    };
+    let Some(reaction) = ReactionType::from_stored(&data.reaction_type) else {
+        return Ok(());
+    };
+    if reaction == ReactionType::None {
+        return Ok(());
+    }
+    let user_id = match i64::try_from(callback.from.id.0) {
+        Ok(user_id) => user_id,
+        Err(source) => {
+            error!(
+                ?source,
+                "legacy recap feedback actor identifier exceeds int64"
+            );
+            return Ok(());
+        }
+    };
+    if let Err(source) = feedback::react(
+        &context.db,
+        feedback::ReactionTable::ChatHistoriesRecaps,
+        data.chat_id,
+        log_id,
+        user_id,
+        reaction,
+    )
+    .await
+    {
+        error!(?source, "failed to apply legacy recap feedback reaction");
+        return Ok(());
+    }
+    let counts = match feedback::counts(
+        &context.db,
+        feedback::ReactionTable::ChatHistoriesRecaps,
+        data.chat_id,
+        log_id,
+    )
+    .await
+    {
+        Ok(counts) => counts,
+        Err(source) => {
+            error!(?source, "failed to count legacy recap feedback reactions");
+            return Ok(());
+        }
+    };
+    let Some(state) = context.recap_state.as_deref() else {
+        error!("legacy recap feedback state store is unavailable");
+        return Ok(());
+    };
+    let canonical_log_id = log_id.to_string();
+    let rebuilt = match build_vote_keyboard(state, data.chat_id, &canonical_log_id, counts).await {
+        Ok(markup) => markup,
+        Err(source) => {
+            error!(?source, "failed to rebuild legacy recap feedback markup");
+            return Ok(());
+        }
+    };
+    let Some(rebuilt_row) = rebuilt.inline_keyboard.into_iter().next() else {
+        return Ok(());
+    };
+    let Some(mut current_markup) = message
+        .regular_message()
+        .and_then(Message::reply_markup)
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if current_markup.inline_keyboard.is_empty() {
+        return Ok(());
+    }
+    let clicked_wire = callback.data.as_deref().unwrap_or_default();
+    for row in &mut current_markup.inline_keyboard {
+        if row.iter().any(|button| {
+            matches!(
+                &button.kind,
+                InlineKeyboardButtonKind::CallbackData(data) if data == clicked_wire
+            )
+        }) {
+            *row = rebuilt_row.clone();
+        }
+    }
+    if let Err(source) = bot
+        .edit_message_reply_markup(ChatId(data.chat_id), message_id)
+        .reply_markup(current_markup)
+        .await
+    {
+        error!(?source, "failed to edit legacy recap feedback markup");
+    }
+    Ok(())
+}
+
 struct ManualCallbackFailure {
     source: anyhow::Error,
     user_message: String,
@@ -671,10 +799,8 @@ async fn send_callback_error(
     }
 }
 
-fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
+pub(crate) fn escape_html(text: &str) -> String {
+    text.replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+        .replace('&', "&amp;")
 }

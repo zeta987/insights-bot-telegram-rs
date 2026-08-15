@@ -442,6 +442,7 @@ impl RecapDeliverySender for TelegramRecapSender {
             .send_plain(TelegramPlainMessageRequest {
                 chat_id: request.chat_id,
                 text: &request.text,
+                parse_mode: None,
                 reply_to_message_id: request.reply_to_message_id,
                 reply_markup: request.reply_markup.as_ref(),
                 disable_notification: request.disable_notification,

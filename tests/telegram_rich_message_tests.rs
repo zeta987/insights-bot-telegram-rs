@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use insights_bot_telegram_rs::{
     config::TelegramConfig,
     services::telegram_rich_message::{
-        RichMessageReplyParameters, RichMessageRequest, TelegramResponseParameters,
-        TelegramRichMessageClient, TelegramRichMessageError,
+        PlainMessageRequest, RichMessageReplyParameters, RichMessageRequest,
+        TelegramResponseParameters, TelegramRichMessageClient, TelegramRichMessageError,
     },
 };
 use serde_json::Value;
@@ -220,4 +220,63 @@ async fn raw_rich_message_checks_api_errors_before_decoding_result() {
             parameters: TelegramResponseParameters::default(),
         }
     );
+}
+
+#[tokio::test]
+async fn raw_plain_message_encodes_parse_mode_when_requested() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"ok":true,"result":{"message_id":44,"date":1710000000,"chat":{"id":123,"type":"private"}}}"#,
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let client = TelegramRichMessageClient::new(reqwest::Client::new(), &telegram_config(&server));
+
+    client
+        .send_plain(PlainMessageRequest {
+            chat_id: 123,
+            text: "<b>Recap</b>",
+            parse_mode: Some("HTML"),
+            ..Default::default()
+        })
+        .await
+        .expect("Telegram success response should decode");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should retain the request");
+    let form = decoded_form(&requests[0].body);
+    assert_eq!(form.get("parse_mode").map(String::as_str), Some("HTML"));
+}
+
+#[tokio::test]
+async fn raw_plain_message_omits_parse_mode_by_default() {
+    let server = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"ok":true,"result":{"message_id":45,"date":1710000000,"chat":{"id":123,"type":"private"}}}"#,
+            "application/json",
+        ))
+        .mount(&server)
+        .await;
+    let client = TelegramRichMessageClient::new(reqwest::Client::new(), &telegram_config(&server));
+
+    client
+        .send_plain(PlainMessageRequest {
+            chat_id: 123,
+            text: "Plain recap",
+            ..Default::default()
+        })
+        .await
+        .expect("Telegram success response should decode");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("wiremock should retain the request");
+    let form = decoded_form(&requests[0].body);
+    assert!(!form.contains_key("parse_mode"));
 }

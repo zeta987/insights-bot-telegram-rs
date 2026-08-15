@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup},
+    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Me},
 };
 use tracing::{error, warn};
 
@@ -237,8 +237,13 @@ pub struct RecapHandlers;
 
 impl RecapHandlers {
     /// Handle /recap command - shows time selection buttons.
-    pub async fn handle_recap(bot: Bot, msg: Message, ctx: Arc<AppContext>) -> ResponseResult<()> {
-        crate::bot::handlers::recap_manual::handle_public_recap_command(bot, msg, ctx).await
+    pub async fn handle_recap(
+        bot: Bot,
+        msg: Message,
+        me: Me,
+        ctx: Arc<AppContext>,
+    ) -> ResponseResult<()> {
+        crate::bot::handlers::recap_manual::handle_public_recap_command(bot, msg, me, ctx).await
     }
 
     pub async fn handle_configure_recap(
@@ -403,10 +408,21 @@ impl RecapHandlers {
             error!(?source, "failed to bind select-hour callback route");
             return Ok(());
         }
+        if let Err(source) = registry.bind(crate::redis::keys::ROUTE_RECAP_FEEDBACK_REACT) {
+            error!(
+                ?source,
+                "failed to bind legacy recap feedback callback route"
+            );
+            return Ok(());
+        }
         if let Err(source) =
             registry.bind(crate::redis::keys::ROUTE_SMR_SUMMARIZATION_FEEDBACK_REACT)
         {
             error!(?source, "failed to bind recap feedback callback route");
+            return Ok(());
+        }
+        if let Err(source) = registry.bind(crate::redis::keys::ROUTE_UNSUBSCRIBE_RECAP) {
+            error!(?source, "failed to bind recap unsubscribe callback route");
             return Ok(());
         }
         let resolution = match registry.resolve(state, &data).await {
@@ -434,8 +450,34 @@ impl RecapHandlers {
                 route,
                 payload_json,
                 ..
+            } if route == crate::redis::keys::ROUTE_RECAP_FEEDBACK_REACT => {
+                crate::bot::handlers::recap_manual::handle_recap_feedback_reaction_callback(
+                    bot,
+                    q,
+                    payload_json,
+                    ctx,
+                )
+                .await
+            }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
             } if route == crate::redis::keys::ROUTE_SMR_SUMMARIZATION_FEEDBACK_REACT => {
                 crate::bot::handlers::recap_manual::handle_feedback_reaction_callback(
+                    bot,
+                    q,
+                    payload_json,
+                    ctx,
+                )
+                .await
+            }
+            crate::redis::recap_state::CallbackResolution::Dispatch {
+                route,
+                payload_json,
+                ..
+            } if route == crate::redis::keys::ROUTE_UNSUBSCRIBE_RECAP => {
+                crate::bot::handlers::recap_subscription::handle_unsubscribe_callback(
                     bot,
                     q,
                     payload_json,
