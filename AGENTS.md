@@ -17,3 +17,17 @@ Follow Conventional Commits as seen in project history: `feat:`, `fix:`, `chore:
 
 ## Security & Configuration Tips
 Start from `.env.example` and never commit real secrets. Document new environment variables in both `.env.example` and `README.md`. Treat migration changes carefully: keep Postgres and SQLite schema files aligned.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub Issues on `zeta987/insights-bot-telegram-rs` via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical triage roles use their default label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
