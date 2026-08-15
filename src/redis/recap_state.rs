@@ -80,6 +80,15 @@ pub trait RecapStateStore: Send + Sync {
     /// lifetime.
     async fn get_callback(&self, route: &str, action_hash: &str) -> Result<Option<String>>;
 
+    /// Apply Go's non-atomic `GET`, `TTL`, `SET EX` command limiter for
+    /// public manual recaps.
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> Result<ManualRecapRateResult>;
+
     /// Store a `/start` deep-link context under `domain`.
     async fn put_start_context(
         &self,
@@ -115,6 +124,14 @@ pub trait RecapStateStore: Send + Sync {
 
     /// Clear the delete-later list and return its well-formed members.
     async fn drain_delete_later(&self, user_id: i64) -> Result<Vec<(i64, i32)>>;
+}
+
+/// Result of Go's manual-recap command rate check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManualRecapRateResult {
+    pub counted_rate: i64,
+    pub ttl_seconds: i64,
+    pub allowed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +434,57 @@ impl RecapStateStore for InMemoryRecapStateStore {
         Ok(self.raw_string(&keys::callback_payload_key(route, action_hash)))
     }
 
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> Result<ManualRecapRateResult> {
+        if per_seconds <= 0 {
+            return Ok(ManualRecapRateResult {
+                counted_rate: 0,
+                ttl_seconds: 0,
+                allowed: true,
+            });
+        }
+
+        let key = keys::manual_recap_rate_key(chat_id);
+        let (now, mut guard) = self.locked();
+        let (mut counted_rate, ttl_seconds) = match guard.get(&key) {
+            Some(Entry {
+                value: Value::Str(value),
+                expires_at_ms,
+            }) => (
+                value
+                    .parse::<i64>()
+                    .map_err(|_| anyhow!("recap Redis GET failed (TypeError)"))?,
+                (*expires_at_ms - now) / 1_000,
+            ),
+            _ => (0, -2),
+        };
+        if counted_rate >= rate {
+            return Ok(ManualRecapRateResult {
+                counted_rate,
+                ttl_seconds,
+                allowed: false,
+            });
+        }
+
+        counted_rate += 1;
+        set_string(
+            &mut guard,
+            now,
+            &key,
+            &counted_rate.to_string(),
+            per_seconds,
+        );
+        Ok(ManualRecapRateResult {
+            counted_rate,
+            ttl_seconds,
+            allowed: true,
+        })
+    }
+
     async fn put_start_context(
         &self,
         domain: StartContextDomain,
@@ -700,6 +768,61 @@ impl RecapStateStore for RedisRecapStateStore {
     async fn get_callback(&self, route: &str, action_hash: &str) -> Result<Option<String>> {
         self.raw_string(&keys::callback_payload_key(route, action_hash))
             .await
+    }
+
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> Result<ManualRecapRateResult> {
+        if per_seconds <= 0 {
+            return Ok(ManualRecapRateResult {
+                counted_rate: 0,
+                ttl_seconds: 0,
+                allowed: true,
+            });
+        }
+
+        let key = keys::manual_recap_rate_key(chat_id);
+        let mut connection = self.connection();
+        let counted: Option<String> = ::redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("GET", &error))?;
+        let mut counted_rate = counted
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<i64>()
+            .map_err(|_| anyhow!("recap Redis GET failed (TypeError)"))?;
+        let ttl_seconds: i64 = ::redis::cmd("TTL")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("TTL", &error))?;
+        if counted_rate >= rate {
+            return Ok(ManualRecapRateResult {
+                counted_rate,
+                ttl_seconds,
+                allowed: false,
+            });
+        }
+
+        counted_rate += 1;
+        let _: () = ::redis::cmd("SET")
+            .arg(&key)
+            .arg(counted_rate)
+            .arg("EX")
+            .arg(per_seconds)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("SET", &error))?;
+        Ok(ManualRecapRateResult {
+            counted_rate,
+            ttl_seconds,
+            allowed: true,
+        })
     }
 
     async fn put_start_context(

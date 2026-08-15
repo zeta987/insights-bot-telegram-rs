@@ -33,6 +33,7 @@ const DELETE_LATER_SEPARATOR: char = ';';
 const CALLBACK_PAYLOAD_KEY_PREFIX: &str = "callback_query/button_data";
 const FORWARDED_KEY_PREFIX: &str = "recap/replay_from_private_message";
 const DELETE_LATER_KEY_PREFIX: &str = "session/delete_later_messages_for_actor";
+const MANUAL_RECAP_RATE_KEY_PREFIX: &str = "rate_limit/manual_recap/command:/recap/group/Telegram";
 
 pub const ROUTE_SELECT_HOUR: &str = "recap/select-hour";
 pub const ROUTE_CONFIGURE_TOGGLE: &str = "recap/configure/toggle";
@@ -182,6 +183,11 @@ pub fn forwarded_batch_key(user_id: i64) -> String {
 /// Redis key of the delete-later list for `user_id`.
 pub fn delete_later_key(user_id: i64) -> String {
     format!("{DELETE_LATER_KEY_PREFIX}/{user_id}")
+}
+
+/// Go's per-group `/recap` command counter key.
+pub fn manual_recap_rate_key(chat_id: i64) -> String {
+    format!("{MANUAL_RECAP_RATE_KEY_PREFIX}/{chat_id}")
 }
 
 /// A `<chat-id>;<message-id>` delete-later list member.

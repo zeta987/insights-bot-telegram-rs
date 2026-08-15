@@ -139,6 +139,17 @@ impl RecapStateStore for RecordingRecapStateStore {
         self.inner.get_callback(route, action_hash).await
     }
 
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> Result<insights_bot_telegram_rs::redis::recap_state::ManualRecapRateResult> {
+        self.inner
+            .check_manual_recap_rate(chat_id, rate, per_seconds)
+            .await
+    }
+
     async fn put_start_context(
         &self,
         domain: StartContextDomain,
