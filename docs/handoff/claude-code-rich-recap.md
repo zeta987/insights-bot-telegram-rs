@@ -32,6 +32,18 @@ formatting and transport, Rich delivery and generation, public manual recap,
 subscriptions, and forwarded recap. Run `git log --oneline -12` after the
 required lock preflight to see the exact current list.
 
+The latest completed automatic-recap commit is `be73d17` (`feat: port automatic
+rich recaps`). A later local checkpoint adds the presentation half of
+`/configure_recap`:
+
+- `src/bot/handlers/recap_configure.rs` exposes `build_configure_keyboard`.
+- `tests/recap_configure_tests.rs` fixes the disabled five-row and enabled
+  nine-row keyboards, exact Simplified Chinese labels, `nop` callback payload,
+  compact camel-case JSON, hashed callback wires, and the pin payload without
+  `fromId`.
+- `src/bot/handlers/mod.rs` exports the new module.
+- The focused keyboard test passed before the checkpoint was committed.
+
 The current automatic-recap checkpoint adds:
 
 - Go TimeCapsule Redis ZSET key and deterministic padded standard-Base64 member.
@@ -65,17 +77,37 @@ Latest verification before this handoff:
 
 ## Next required slice
 
-Port `/configure_recap` from the pinned Go callback implementation. Rust still
-has the legacy `recap_configs` UI and raw `cfg:*` callback data in
-`src/bot/handlers/recap.rs`. It must use the parity repositories and the nine
-registered hashed callback routes.
+Finish `/configure_recap` from the pinned Go callback implementation. The exact
+keyboard and callback-allocation primitive already exists, but
+`src/bot/handlers/recap.rs` still runs the legacy `recap_configs` command and
+raw `cfg:*` callback path. Replace that runtime path with the new module, parity
+repositories, and the five registered configure routes.
 
 Required behavior includes the feature toggle, public/private send mode,
 2/3/4-per-day rate, pin toggle, exact Go callback payload JSON and labels,
 owner/admin gates, and completion behavior. Enabling recap and changing the
 daily rate must immediately add or rescore the deterministic TimeCapsule member.
 Disabling recap must leave an already queued member in Redis; its later disabled
-read consumes it without requeueing. Add RED tests before implementation.
+read consumes it without requeueing. Add one RED handler test before each
+vertical implementation slice.
+
+The remaining production work is the command handler plus toggle, assign-mode,
+complete, rates-per-day, and pin callbacks. Preserve these pinned details:
+
+- Toggle accepts creator, administrator, or the exact Group Anonymous Bot;
+  assign-mode, rate, and pin are creator-only; complete accepts creator,
+  administrator, or anonymous and does not recheck bot-admin status.
+- Toggle, assign-mode, rate, and complete validate callback chat and actor, with
+  the anonymous original-command exception. Pin intentionally has no such
+  payload guard.
+- Complete best-effort deletes both the settings message and its replied-to
+  command without sending a completion message.
+- Rate changes rescore even while the feature is disabled. Disable never
+  removes the existing capsule.
+- Pin rebuilds the keyboard with its requested pin status incorrectly reused as
+  recap-enabled status. This visible Go quirk must remain fixed by a test.
+- The approved ledger resolves the first-enable missing-options crash by using
+  a usable first-enable options row before queueing; do not add a process panic.
 
 After configuration is complete, perform a read-only Go/Rust parity review of
 the automatic worker, run the full verification set, scan the exact staged diff
