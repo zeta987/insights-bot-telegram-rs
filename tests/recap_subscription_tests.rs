@@ -107,6 +107,22 @@ fn anonymous_group_command(text: &str) -> Message {
     .expect("valid anonymous Telegram command fixture")
 }
 
+fn private_command(text: &str) -> Message {
+    serde_json::from_value(serde_json::json!({
+        "message_id": 95,
+        "date": 1_710_000_013,
+        "from": {
+            "id": 42,
+            "is_bot": false,
+            "first_name": "Ada",
+            "username": "ada"
+        },
+        "chat": {"id": 42, "type": "private", "first_name": "Ada"},
+        "text": text
+    }))
+    .expect("valid Telegram private command fixture")
+}
+
 fn start_message(token: &str) -> Message {
     serde_json::from_value(serde_json::json!({
         "message_id": 91,
@@ -330,6 +346,36 @@ async fn private_mode_database() -> Database {
     .await
     .expect("private recap mode");
     database
+}
+
+/// Force every future subscriber insert to fail, so the DM-succeeds-then-DB-fails
+/// branch can be exercised without a mock database layer.
+async fn block_subscriber_inserts(database: &Database) {
+    sqlx::query(
+        "CREATE TRIGGER block_subscriber_insert
+         BEFORE INSERT ON telegram_chat_auto_recaps_subscribers
+         BEGIN
+             SELECT RAISE(ABORT, 'forced insert failure for parity test');
+         END;",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("install insert-blocking trigger");
+}
+
+/// Force every future subscriber delete to fail, so the unsubscribe DB-failure
+/// branch can be exercised without a mock database layer.
+async fn block_subscriber_deletes(database: &Database) {
+    sqlx::query(
+        "CREATE TRIGGER block_subscriber_delete
+         BEFORE DELETE ON telegram_chat_auto_recaps_subscribers
+         BEGIN
+             SELECT RAISE(ABORT, 'forced delete failure for parity test');
+         END;",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("install delete-blocking trigger");
 }
 
 #[test]
@@ -1794,4 +1840,394 @@ async fn unknown_persisted_send_mode_uses_public_selector_and_rate_limit() {
         .expect("selector payload")
         .expect("live selector payload");
     assert!(payload.contains(r#""recap_mode":0"#));
+}
+
+#[tokio::test]
+async fn subscribe_command_private_chat_rejects_without_tracking() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(telegram_message_result(905, 42, "private", "gate")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state.clone()).await;
+
+    handle_subscribe_recap_command(
+        context.config.telegram.bot(),
+        private_command("/subscribe_recap"),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("private-chat subscribe gate");
+
+    assert!(
+        state.raw_list(&keys::delete_later_key(42)).is_none(),
+        "the chat-type gate returns before any delete-later tracking"
+    );
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1);
+    let reply = request_body(&requests[0]);
+    assert_eq!(
+        reply["text"],
+        "只有在群组和超级群组内才可以订阅定时的聊天记录回顾哦！"
+    );
+    assert_eq!(reply["reply_parameters"]["message_id"], 95);
+    assert!(reply.get("parse_mode").is_none());
+}
+
+#[tokio::test]
+async fn subscribe_command_anonymous_bot_rejects_and_tracks_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_message_result(
+                902,
+                CHAT_ID,
+                "supergroup",
+                "anonymous subscribe error",
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    handle_subscribe_recap_command(
+        context.config.telegram.bot(),
+        anonymous_group_command("/subscribe_recap"),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("anonymous subscribe command");
+
+    assert!(
+        subscribers::find_one(&database, CHAT_ID, 1_087_968_824)
+            .await
+            .expect("subscriber lookup")
+            .is_none()
+    );
+    assert_eq!(
+        state.raw_list(&keys::delete_later_key(1_087_968_824)),
+        Some(vec![format!("{CHAT_ID};902")])
+    );
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1);
+    let response = request_body(&requests[0]);
+    assert_eq!(
+        response["text"],
+        "匿名管理员无法订阅定时的聊天记录回顾哦！如果需要订阅定时的聊天记录回顾，必须先将发送角色切换为普通用户然后再试哦。"
+    );
+    assert!(response.get("parse_mode").is_none());
+    assert_eq!(response["reply_parameters"]["message_id"], 78);
+}
+
+#[tokio::test]
+async fn subscribe_command_db_failure_after_dm_sends_error_and_leaves_no_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/sendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_message_result(
+                903,
+                42,
+                "private",
+                "subscribed",
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_message_result(
+                904,
+                CHAT_ID,
+                "supergroup",
+                "subscribe db error",
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    feature_flags::enable_recap(&database, CHAT_ID, "supergroup", "Parity <Lab> & Friends")
+        .await
+        .expect("enable recap");
+    block_subscriber_inserts(&database).await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    handle_subscribe_recap_command(
+        context.config.telegram.bot(),
+        group_command("/subscribe_recap"),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("subscribe DB failure path");
+
+    assert!(
+        subscribers::find_one(&database, CHAT_ID, 42)
+            .await
+            .expect("subscriber lookup")
+            .is_none(),
+        "the blocked insert must leave no subscriber row"
+    );
+    assert_eq!(
+        state.raw_list(&keys::delete_later_key(42)),
+        Some(vec![format!("{CHAT_ID};904")])
+    );
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.url.path())
+            .collect::<Vec<_>>(),
+        [
+            "/telegram/bottest-token/sendMessage",
+            "/telegram/bottest-token/SendMessage",
+        ]
+    );
+    let error_reply = request_body(&requests[1]);
+    assert_eq!(
+        error_reply["text"],
+        "订阅群组定时聊天回顾时出现问题，请稍后再试！"
+    );
+    assert_eq!(error_reply["reply_parameters"]["message_id"], 77);
+    assert!(error_reply.get("parse_mode").is_none());
+}
+
+#[tokio::test]
+async fn unsubscribe_command_private_chat_rejects_without_tracking() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(telegram_message_result(906, 42, "private", "gate")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state.clone()).await;
+
+    handle_unsubscribe_recap_command(
+        context.config.telegram.bot(),
+        private_command("/unsubscribe_recap"),
+        context,
+    )
+    .await
+    .expect("private-chat unsubscribe gate");
+
+    assert!(
+        state.raw_list(&keys::delete_later_key(42)).is_none(),
+        "the chat-type gate returns before any delete-later tracking"
+    );
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1);
+    let reply = request_body(&requests[0]);
+    assert_eq!(
+        reply["text"],
+        "只有在群组和超级群组内才可以取消订阅定时的聊天记录回顾哦！"
+    );
+    assert_eq!(reply["reply_parameters"]["message_id"], 95);
+    assert!(reply.get("parse_mode").is_none());
+}
+
+#[tokio::test]
+async fn unsubscribe_command_anonymous_bot_silently_deletes_command() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/DeleteMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": true
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state).await;
+
+    handle_unsubscribe_recap_command(
+        context.config.telegram.bot(),
+        anonymous_group_command("/unsubscribe_recap"),
+        context,
+    )
+    .await
+    .expect("anonymous unsubscribe command");
+
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1, "Go sends no text, only the deletion");
+    assert_eq!(
+        requests[0].url.path(),
+        "/telegram/bottest-token/DeleteMessage"
+    );
+}
+
+#[tokio::test]
+async fn unsubscribe_command_db_failure_sends_error_and_keeps_row() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_message_result(
+                907,
+                CHAT_ID,
+                "supergroup",
+                "unsubscribe db error",
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    subscribers::subscribe(&database, CHAT_ID, 42)
+        .await
+        .expect("plant subscriber");
+    block_subscriber_deletes(&database).await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    handle_unsubscribe_recap_command(
+        context.config.telegram.bot(),
+        group_command("/unsubscribe_recap"),
+        context,
+    )
+    .await
+    .expect("unsubscribe DB failure path");
+
+    assert!(
+        subscribers::find_one(&database, CHAT_ID, 42)
+            .await
+            .expect("subscriber lookup")
+            .is_some(),
+        "the blocked delete must preserve the original row"
+    );
+    assert_eq!(
+        state.raw_list(&keys::delete_later_key(42)),
+        Some(vec![format!("{CHAT_ID};907")])
+    );
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].url.path(),
+        "/telegram/bottest-token/SendMessage"
+    );
+    let error_reply = request_body(&requests[0]);
+    assert_eq!(
+        error_reply["text"],
+        "订阅群组定时聊天回顾时出现问题，请稍后再试！"
+    );
+    assert_eq!(error_reply["reply_parameters"]["message_id"], 77);
+    assert!(error_reply.get("parse_mode").is_none());
+}
+
+#[tokio::test]
+async fn start_continuation_subscribe_db_failure_sends_error_and_keeps_context_reusable() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_message_result(
+                908,
+                42,
+                "private",
+                "start subscribe db error",
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    block_subscriber_inserts(&database).await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let token = "subscribe-db-failure";
+    let payload =
+        encode_start_context(CHAT_ID, "Subscribe DB Failure").expect("subscription start context");
+    state
+        .put_start_context(keys::StartContextDomain::SubscribeRecap, token, &payload)
+        .await
+        .expect("store subscription context");
+    let context = command_context(&server, database.clone(), state.clone()).await;
+
+    assert!(
+        handle_start_continuation(
+            &context.config.telegram.bot(),
+            &start_message(token),
+            token,
+            &context,
+        )
+        .await
+        .expect("start continuation subscribe DB failure")
+    );
+
+    assert!(
+        subscribers::find_one(&database, CHAT_ID, 42)
+            .await
+            .expect("subscriber lookup")
+            .is_none(),
+        "the blocked insert must leave no subscriber row"
+    );
+    assert_eq!(
+        state
+            .get_start_context(keys::StartContextDomain::SubscribeRecap, token)
+            .await
+            .expect("subscription context reread")
+            .as_deref(),
+        Some(payload.as_str()),
+        "the context must stay reusable after a failed subscribe"
+    );
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1);
+    let error_reply = request_body(&requests[0]);
+    assert_eq!(
+        error_reply["text"],
+        "订阅群组定时聊天回顾时出现问题，请稍后再试！"
+    );
+    assert_eq!(error_reply["reply_parameters"]["message_id"], 91);
+    assert!(error_reply.get("parse_mode").is_none());
 }
