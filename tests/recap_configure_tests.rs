@@ -39,6 +39,7 @@ const START_MS: i64 = 1_700_000_000_000;
 const CHAT_ID: i64 = -1_001_234_567_890;
 const FROM_ID: i64 = 42;
 const GROUP_ANONYMOUS_BOT_ID: i64 = 1_087_968_824;
+const PRIVATE_CHAT_ID: i64 = 4_242;
 
 fn bot_me() -> Me {
     serde_json::from_value(serde_json::json!({
@@ -208,6 +209,19 @@ fn configure_callback_with_markup(wire: &str, markup: &Value) -> CallbackQuery {
     let mut value = serde_json::to_value(configure_callback(wire)).expect("serialize callback");
     value["message"]["reply_markup"] = markup.clone();
     serde_json::from_value(value).expect("configure callback with markup")
+}
+
+fn private_configure_callback(wire: &str, markup: &Value) -> CallbackQuery {
+    let mut value = serde_json::to_value(configure_callback_with_markup(wire, markup))
+        .expect("serialize callback");
+    let private_chat = serde_json::json!({
+        "id": PRIVATE_CHAT_ID,
+        "type": "private",
+        "first_name": "Ada"
+    });
+    value["message"]["chat"] = private_chat.clone();
+    value["message"]["reply_to_message"]["chat"] = private_chat;
+    serde_json::from_value(value).expect("private configure callback")
 }
 
 fn request_body(request: &wiremock::Request) -> Value {
@@ -1331,4 +1345,99 @@ async fn expired_toggle_edits_plain_error_and_preserves_the_existing_keyboard() 
         value => value.clone(),
     };
     assert_eq!(retained_markup, keyboard);
+}
+
+#[tokio::test]
+async fn private_config_callbacks_stop_after_bot_admin_check_without_mutation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_owner_result()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: PRIVATE_CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("enabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wires = [
+        &keyboard["inline_keyboard"][1][0]["callback_data"],
+        &keyboard["inline_keyboard"][3][1]["callback_data"],
+        &keyboard["inline_keyboard"][5][0]["callback_data"],
+        &keyboard["inline_keyboard"][7][0]["callback_data"],
+    ];
+    let context = command_context(&server, database.clone(), state).await;
+
+    for wire in wires {
+        RecapHandlers::handle_callback_query_with_me(
+            context.config.telegram.bot(),
+            private_configure_callback(wire.as_str().expect("callback wire"), &keyboard),
+            bot_me(),
+            context.clone(),
+        )
+        .await
+        .expect("private callback denial");
+    }
+
+    assert!(
+        recap_options::find_one(&database, PRIVATE_CHAT_ID)
+            .await
+            .expect("recap options lookup")
+            .is_none(),
+        "Go rejects the chat before any configuration write"
+    );
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.url.path().ends_with("/GetChatMember")
+                    && request_body(request)["user_id"] == FROM_ID
+            })
+            .count(),
+        0,
+        "Go checks chat type before actor membership"
+    );
+    let edits = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/EditMessageText"))
+        .collect::<Vec<_>>();
+    assert_eq!(edits.len(), 4);
+    for edit in edits {
+        let body = request_body(edit);
+        assert_eq!(body["parse_mode"], "HTML");
+        assert_eq!(
+            body["text"],
+            "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，聊天记录回顾功能只有<b>群组</b>和<b>超级群组</b>的管理员可以配置哦！\n请将 Bot 添加到群组中，并配置 Bot 为管理员后使用管理员权限的用户账户为 Bot 进行配置吧。"
+        );
+    }
 }

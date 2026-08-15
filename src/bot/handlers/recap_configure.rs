@@ -33,6 +33,7 @@ const ACTOR_ADMIN_REQUIRED: &str =
 const CONFIGURE_UNAVAILABLE: &str = "暂时无法配置聊天记录回顾功能，请稍后再试！";
 const APPLY_CONFIG_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾功能的配置时出现了问题，请稍后再试！";
 const CALLBACK_BOT_ADMIN_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，现在机器人不是<b>群组管理员</b>，已经不会记录任何聊天记录了。如果需要配置聊天记录回顾功能，<b>请先将机器人设为群组管理员</b>，然后再次执行命令后再试";
+const CALLBACK_GROUP_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，聊天记录回顾功能只有<b>群组</b>和<b>超级群组</b>的管理员可以配置哦！\n请将 Bot 添加到群组中，并配置 Bot 为管理员后使用管理员权限的用户账户为 Bot 进行配置吧。";
 const CREATOR_MODE_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，抱歉，此操作无法进行，只有<b>群组创建者</b>角色可以配置聊天记录回顾的模式。";
 const APPLY_PIN_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾消息置顶功能的配置时出现了问题，请稍后再试！";
 
@@ -45,6 +46,10 @@ enum CreatorOnlyPermission {
 
 fn display_rate(rates_per_day: i64) -> i64 {
     if rates_per_day == 0 { 4 } else { rates_per_day }
+}
+
+fn is_recap_configuration_chat(message: &Message) -> bool {
+    message.chat.is_group() || message.chat.is_supergroup()
 }
 
 /// Current values rendered by Go's `/configure_recap` keyboard.
@@ -356,6 +361,9 @@ pub async fn handle_toggle_callback(
     if !bot_is_admin {
         return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
+    if !is_recap_configuration_chat(message) {
+        return edit_configuration_html(&bot, &callback, CALLBACK_GROUP_REQUIRED, None).await;
+    }
     let actor_is_admin =
         match check_admin_or_anonymous_permission(&bot, message, &callback.from).await {
             Ok(allowed) => allowed,
@@ -476,6 +484,9 @@ pub async fn handle_assign_mode_callback(
     if !bot_is_admin {
         return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
+    if !is_recap_configuration_chat(message) {
+        return edit_configuration_html(&bot, &callback, CALLBACK_GROUP_REQUIRED, None).await;
+    }
     let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
     {
         Ok(permission) => permission,
@@ -590,6 +601,9 @@ pub async fn handle_rates_callback(
     };
     if !bot_is_admin {
         return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
+    }
+    if !is_recap_configuration_chat(message) {
+        return edit_configuration_html(&bot, &callback, CALLBACK_GROUP_REQUIRED, None).await;
     }
     let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
     {
@@ -706,6 +720,9 @@ pub async fn handle_pin_callback(
     };
     if !bot_is_admin {
         return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
+    }
+    if !is_recap_configuration_chat(message) {
+        return edit_configuration_html(&bot, &callback, CALLBACK_GROUP_REQUIRED, None).await;
     }
     let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
     {

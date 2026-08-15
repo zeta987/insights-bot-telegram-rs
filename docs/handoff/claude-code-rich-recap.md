@@ -84,11 +84,14 @@ success-only audit originally missed:
   permission errors use `HTML`.
 - An expired configure callback receives the fixed plain error edit and the
   existing inline keyboard is sent back unchanged.
+- Toggle, mode, rate, and pin callbacks now perform Go's group/supergroup gate
+  after the bot-admin lookup and before actor lookup or persistence. Crafted
+  private callbacks receive the exact HTML error and retain their keyboard.
 - The toggle integration now proves disable leaves the existing deterministic
   queue member untouched, and the rate integration proves a disabled chat is
   still rescored without being enabled.
-- Four RED-to-GREEN transport tests raise the focused configuration total to
-  eleven.
+- Five RED-to-GREEN transport tests raise the focused configuration total to
+  twelve.
 
 The current automatic-recap checkpoint adds:
 
@@ -120,7 +123,7 @@ Latest verification before this handoff:
 
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
-- `/configure_recap` focused tests passed: 11.
+- `/configure_recap` focused tests passed: 12.
 - Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
 
 ## Next required slice
@@ -129,9 +132,9 @@ Continue the read-only pinned-Go versus Rust audit of the completed automatic
 worker and configuration runtime; passing tests do not prove every error branch.
 The ordinary-member, creator-only, GroupAnonymousBot actor lookup, expired
 payload, toggle-off queue retention, disabled-rate-rescore, and two-phase
-startup seed branches are complete. Next verify production worker invocation
-and direct test-capsule startup behavior, then check original-message
-anonymous-origin exceptions plus the callback group-only and remaining Bot API
+startup seed and callback group-only branches are complete. Next verify
+production worker invocation and direct test-capsule startup behavior, then
+check original-message anonymous-origin exceptions plus the remaining Bot API
 failure branches.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
