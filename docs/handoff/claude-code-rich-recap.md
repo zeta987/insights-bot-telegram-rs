@@ -222,7 +222,8 @@ available for a later live Telegram test after local verification.
   it prints `False`. Never delete a lock that may belong to another process.
 - Local commits only until the user explicitly asks to push.
 - Commit with `git commit -S` and the exact trailer:
-  `Co-authored-by: Codex <noreply@openai.com>`
+  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
+  The old Codex co-author trailer is retired; do not add it to new commits.
 - Verify the signature with `git verify-commit HEAD` and verify the exact trailer.
 - Scan staged changes for API keys, tokens, passwords, private endpoints, email
   addresses, and personal data before committing.
@@ -244,5 +245,5 @@ slice`; do not broadly refactor existing handlers. Do not redo
 completed modules merely because their implementation is
 unfamiliar: compare production callsites and tests first. Use TDD, keep edits
 scoped, run focused plus full Rust verification, perform a staged secrets/PII
-scan, and create signed local commits with the exact Codex co-author trailer.
+scan, and create signed local commits with the exact Claude co-author trailer.
 Never push unless the user explicitly authorizes that push.
