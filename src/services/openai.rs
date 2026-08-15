@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use async_openai::{
@@ -7,7 +7,7 @@ use async_openai::{
     types::{
         ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
         ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        CreateChatCompletionRequestArgs,
+        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
     },
 };
 use async_trait::async_trait;
@@ -21,11 +21,13 @@ use crate::{
             ANY_SUMMARIZATION_SYSTEM_PROMPT, CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
             CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_USER_PROMPT,
             CHECK_SUMMARY_JSON_SYSTEM_PROMPT, CHECK_SUMMARY_JSON_USER_PROMPT,
-            ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, PromptConfig, StructuredSummary,
-            TopicSummary, render_any_summarization_user_prompt,
-            render_one_chat_history_user_prompt, render_structured_summary_user_prompt,
+            LEGACY_STRUCTURED_SUMMARY_SYSTEM_PROMPT, ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
+            PromptConfig, StructuredSummary, TopicSummary, render_any_summarization_user_prompt,
+            render_chat_history_summarization_user_prompt, render_one_chat_history_user_prompt,
+            render_structured_summary_user_prompt,
         },
         rate_limit::GoRateLimiter,
+        rich_recap::{CondensedExecutionTrace, RecapExecutionTrace},
     },
 };
 
@@ -37,6 +39,74 @@ pub const SUMMARIZE_ANY_OPERATION: &str = "Summarize Any";
 
 /// Go's `SetPromptOperation("Summarize One Chat History")`.
 pub const SUMMARIZE_ONE_CHAT_HISTORY_OPERATION: &str = "Summarize One Chat History";
+
+pub const SUMMARIZE_CHAT_HISTORIES_OPERATION: &str = "Summarize Chat Histories";
+
+pub const SARCASTIC_CONDENSE_OPERATION: &str = "Sarcastic Condense";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetailedSliceResult {
+    pub content: String,
+    pub usage: TokenUsage,
+    pub trace: RecapExecutionTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CondensedResult {
+    pub content: String,
+    pub trace: CondensedExecutionTrace,
+}
+
+#[derive(Debug)]
+pub struct DetailedGenerationError {
+    pub source: anyhow::Error,
+    pub trace: RecapExecutionTrace,
+}
+
+impl fmt::Display for DetailedGenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for DetailedGenerationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug)]
+pub struct CondensedGenerationError {
+    pub source: anyhow::Error,
+    pub trace: CondensedExecutionTrace,
+}
+
+enum CondensedBackupOutcome {
+    Valid {
+        response: CreateChatCompletionResponse,
+        used_model: String,
+    },
+    Invalid {
+        response: CreateChatCompletionResponse,
+        used_model: String,
+        raw_output: String,
+        validation_error: anyhow::Error,
+        last_error: anyhow::Error,
+    },
+    Failed(anyhow::Error),
+}
+
+impl fmt::Display for CondensedGenerationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for CondensedGenerationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 /// The seam for Go's `enableMetricRecordForTokens` side effect.
 ///
@@ -53,8 +123,9 @@ pub const SUMMARIZE_ONE_CHAT_HISTORY_OPERATION: &str = "Summarize One Chat Histo
 /// the whole block is skipped.
 #[async_trait]
 pub trait TokenUsageRecorder: Send + Sync {
-    /// `model_name` is Go's `c.modelName`, the model that was *requested*, not
-    /// the `model` the response echoes back.
+    /// `model_name` follows the operation's Go behavior. Rich recap operations
+    /// pass response `model` when non-empty and otherwise the requested model;
+    /// the older preprocessing helpers always pass their requested model.
     async fn record(
         &self,
         prompt_operation: &str,
@@ -70,6 +141,11 @@ pub struct OpenAiClient {
     pub sarcastic_model: Option<String>,
     pub check_model: Option<String>,
     pub check_model_backup: Option<String>,
+    primary_backups: Vec<String>,
+    condensed_backups: Vec<String>,
+    check_backups: Vec<String>,
+    force_check_failure: bool,
+    force_condensed_primary_failure: bool,
     token_limit: Option<u32>,
     pub prompt_config: PromptConfig,
     /// Go's `c.limiter`, shared by every clone as it is shared by every
@@ -113,6 +189,11 @@ impl OpenAiClient {
             sarcastic_model,
             check_model,
             check_model_backup,
+            primary_backups: recap.primary_backups.clone(),
+            condensed_backups: recap.condensed_backups.clone(),
+            check_backups: recap.check_backups.clone(),
+            force_check_failure: recap.force_check_failure,
+            force_condensed_primary_failure: recap.force_condensed_primary_failure,
             token_limit: u32::try_from(recap.token_limit).ok(),
             prompt_config,
             limiter,
@@ -138,6 +219,657 @@ impl OpenAiClient {
 
     pub fn rate_limiter(&self) -> &Arc<GoRateLimiter> {
         &self.limiter
+    }
+
+    pub fn split_content_by_token_limit(&self, content: &str, limit: usize) -> Result<Vec<String>> {
+        anyhow::ensure!(limit > 0, "token limit must be greater than zero");
+        if content.is_empty() {
+            return Ok(vec![String::new()]);
+        }
+
+        let encoding = tiktoken_rs::cl100k_base()?;
+        let mut remaining = content;
+        let mut slices = Vec::new();
+        while !remaining.is_empty() {
+            let tokens = encoding.encode_ordinary(remaining);
+            if tokens.len() <= limit {
+                slices.push(remaining.to_string());
+                break;
+            }
+
+            let mut bytes = encoding
+                ._decode_native_and_split(tokens[..limit].to_vec())
+                .flatten()
+                .collect::<Vec<_>>();
+            while std::str::from_utf8(&bytes).is_err() {
+                bytes.pop();
+            }
+            let mut slice = String::from_utf8(bytes).context("cl100k token slice was not UTF-8")?;
+            if slice.is_empty() {
+                slice.push(
+                    remaining
+                        .chars()
+                        .next()
+                        .expect("remaining content is non-empty"),
+                );
+            }
+            remaining = &remaining[slice.len()..];
+            slices.push(slice);
+        }
+        Ok(slices)
+    }
+
+    async fn call_rich_completion(
+        &self,
+        model: &str,
+        messages: Vec<ChatCompletionRequestMessage>,
+        temperature: Option<f32>,
+    ) -> Result<CreateChatCompletionResponse> {
+        self.limiter.take().await;
+        let request = if let Some(temperature) = temperature {
+            CreateChatCompletionRequestArgs::default()
+                .model(model)
+                .messages(messages)
+                .temperature(temperature)
+                .build()?
+        } else {
+            CreateChatCompletionRequestArgs::default()
+                .model(model)
+                .messages(messages)
+                .build()?
+        };
+
+        self.client
+            .chat()
+            .create(request)
+            .await
+            .map_err(anyhow::Error::from)
+    }
+
+    pub async fn summarize_chat_histories_raw(
+        &self,
+        content: &str,
+        language: &str,
+    ) -> std::result::Result<DetailedSliceResult, DetailedGenerationError> {
+        let mut trace = RecapExecutionTrace::default();
+        trace.generation.primary_model = self.model.clone();
+        trace.generation.backup_model = self.primary_backups.join(", ");
+
+        let language = if language.is_empty() {
+            self.prompt_config.summarization_language.as_str()
+        } else {
+            language
+        };
+        let user_prompt = render_chat_history_summarization_user_prompt(language, content)
+            .map_err(|source| DetailedGenerationError {
+                source,
+                trace: trace.clone(),
+            })?;
+        let messages = vec![
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT.into(),
+                name: None,
+            }),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
+                name: None,
+            }),
+        ];
+
+        let mut response = match self
+            .call_rich_completion(&self.model, messages.clone(), None)
+            .await
+        {
+            Ok(response) => response,
+            Err(source) => {
+                trace.generation.primary_failed = true;
+                trace.generation.primary_failure_reason = source.to_string();
+                if self.primary_backups.is_empty() {
+                    return Err(DetailedGenerationError { source, trace });
+                }
+                trace.generation.backup_used = true;
+                match self.try_detailed_backups(&messages, &mut trace).await {
+                    Ok(response) => response,
+                    Err(source) => return Err(DetailedGenerationError { source, trace }),
+                }
+            }
+        };
+
+        if !trace.generation.backup_used {
+            trace.generation.primary_used_model = resolved_model(&response, &self.model);
+        }
+        let primary_content_is_empty = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_deref())
+            .is_none_or(|value| value.trim().is_empty());
+        if primary_content_is_empty && !trace.generation.backup_used {
+            let source = anyhow::anyhow!("primary model returned empty recap content");
+            trace.generation.primary_failed = true;
+            trace.generation.primary_failure_reason = source.to_string();
+            if self.primary_backups.is_empty() {
+                return Err(DetailedGenerationError { source, trace });
+            }
+            trace.generation.backup_used = true;
+            response = match self.try_detailed_backups(&messages, &mut trace).await {
+                Ok(response) => response,
+                Err(source) => return Err(DetailedGenerationError { source, trace }),
+            };
+        }
+
+        let used_model = if response.model.trim().is_empty() {
+            if trace.generation.backup_used {
+                trace.generation.backup_used_model.clone()
+            } else {
+                self.model.clone()
+            }
+        } else {
+            response.model.clone()
+        };
+        if trace.generation.backup_used {
+            trace.generation.backup_used_model = used_model.clone();
+        } else {
+            trace.generation.primary_used_model = used_model.clone();
+        }
+
+        let content = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+        let usage = token_usage(&response);
+        self.record_usage_nonfatal(SUMMARIZE_CHAT_HISTORIES_OPERATION, usage, &used_model)
+            .await;
+
+        Ok(DetailedSliceResult {
+            content,
+            usage,
+            trace,
+        })
+    }
+
+    async fn try_detailed_backups(
+        &self,
+        messages: &[ChatCompletionRequestMessage],
+        trace: &mut RecapExecutionTrace,
+    ) -> Result<CreateChatCompletionResponse> {
+        let mut last_error = anyhow::anyhow!("all backup recap models failed");
+        for backup in &self.primary_backups {
+            match self
+                .call_rich_completion(backup, messages.to_vec(), None)
+                .await
+            {
+                Ok(response)
+                    if response
+                        .choices
+                        .first()
+                        .and_then(|choice| choice.message.content.as_deref())
+                        .is_some_and(|value| !value.trim().is_empty()) =>
+                {
+                    let used_model = if response.model.trim().is_empty() {
+                        backup.clone()
+                    } else {
+                        response.model.clone()
+                    };
+                    trace.generation.backup_succeeded = true;
+                    trace.generation.primary_used_model.clear();
+                    trace.generation.backup_used_model = used_model;
+                    trace.generation.backup_failure_reason.clear();
+                    return Ok(response);
+                }
+                Ok(_) => {
+                    last_error = anyhow::anyhow!("backup model returned empty recap content");
+                }
+                Err(error) => last_error = error,
+            }
+        }
+        trace.generation.backup_succeeded = false;
+        trace.generation.backup_failure_reason = last_error.to_string();
+        Err(last_error)
+    }
+
+    async fn record_usage_nonfatal(&self, operation: &str, usage: TokenUsage, model: &str) {
+        if let Some(recorder) = &self.token_usage_recorder
+            && recorder.record(operation, usage, model).await.is_err()
+        {
+            tracing::error!("failed to record OpenAI token usage");
+        }
+    }
+
+    pub async fn sarcastic_condense_traced(
+        &self,
+        content: &str,
+    ) -> std::result::Result<CondensedResult, CondensedGenerationError> {
+        let condensed_model = self
+            .sarcastic_model
+            .as_deref()
+            .unwrap_or(&self.model)
+            .to_string();
+        let mut trace = CondensedExecutionTrace::default();
+        trace.generation.primary_model = condensed_model.clone();
+        trace.generation.backup_model = self.condensed_backups.join(", ");
+        trace.check.generation.primary_model = self.check_model.clone().unwrap_or_default();
+        trace.check.generation.backup_model = self.check_backups.join(", ");
+
+        if content.is_empty() {
+            return Ok(CondensedResult {
+                content: String::new(),
+                trace,
+            });
+        }
+
+        let user_prompt = self
+            .prompt_config
+            .render_sarcastic_user_prompt(content)
+            .map_err(|source| CondensedGenerationError {
+                source,
+                trace: trace.clone(),
+            })?;
+        let messages = vec![
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: self.prompt_config.sarcastic_system_prompt.clone().into(),
+                name: None,
+            }),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
+                name: None,
+            }),
+        ];
+
+        let mut response = match self
+            .call_rich_completion(&condensed_model, messages.clone(), Some(0.7))
+            .await
+        {
+            Ok(response) => response,
+            Err(source) => {
+                trace.generation.primary_failed = true;
+                trace.generation.primary_failure_reason = source.to_string();
+                if self.condensed_backups.is_empty() {
+                    return Err(CondensedGenerationError { source, trace });
+                }
+                trace.generation.backup_used = true;
+                match self.try_condensed_backups(&messages, &mut trace).await {
+                    CondensedBackupOutcome::Valid {
+                        response,
+                        used_model,
+                    } => {
+                        mark_condensed_backup_success(&mut trace, &used_model);
+                        return self.finish_condensed(response, true, trace).await;
+                    }
+                    CondensedBackupOutcome::Invalid {
+                        response,
+                        used_model,
+                        raw_output,
+                        validation_error,
+                        last_error,
+                    } => {
+                        mark_condensed_backup_failure(&mut trace, &last_error, Some(&used_model));
+                        return self
+                            .repair_and_finish_condensed(
+                                response,
+                                true,
+                                raw_output,
+                                validation_error,
+                                trace,
+                            )
+                            .await;
+                    }
+                    CondensedBackupOutcome::Failed(source) => {
+                        mark_condensed_backup_failure(&mut trace, &source, None);
+                        return Err(CondensedGenerationError { source, trace });
+                    }
+                }
+            }
+        };
+
+        if self.force_condensed_primary_failure && !self.condensed_backups.is_empty() {
+            let forced = anyhow::anyhow!("forced condensed primary failure via env switch");
+            trace.generation.primary_failed = true;
+            trace.generation.primary_failure_reason = forced.to_string();
+            trace.generation.backup_used = true;
+            match self.try_condensed_backups(&messages, &mut trace).await {
+                CondensedBackupOutcome::Valid {
+                    response,
+                    used_model,
+                } => {
+                    mark_condensed_backup_success(&mut trace, &used_model);
+                    return self.finish_condensed(response, true, trace).await;
+                }
+                CondensedBackupOutcome::Invalid {
+                    response,
+                    used_model,
+                    raw_output,
+                    validation_error,
+                    last_error,
+                } => {
+                    mark_condensed_backup_failure(&mut trace, &last_error, Some(&used_model));
+                    return self
+                        .repair_and_finish_condensed(
+                            response,
+                            true,
+                            raw_output,
+                            validation_error,
+                            trace,
+                        )
+                        .await;
+                }
+                CondensedBackupOutcome::Failed(source) => {
+                    mark_condensed_backup_failure(&mut trace, &source, None);
+                    return Err(CondensedGenerationError { source, trace });
+                }
+            }
+        }
+
+        let primary_has_no_content = response.choices.is_empty()
+            || response
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.as_deref())
+                .is_none_or(str::is_empty);
+        if primary_has_no_content {
+            trace.generation.primary_failed = true;
+            trace.generation.primary_failure_reason =
+                "no content generated from primary model".to_owned();
+            if self.condensed_backups.is_empty() {
+                return Err(CondensedGenerationError {
+                    source: anyhow::anyhow!("no content generated"),
+                    trace,
+                });
+            }
+
+            trace.generation.backup_used = true;
+            match self.try_condensed_backups(&messages, &mut trace).await {
+                CondensedBackupOutcome::Valid {
+                    response,
+                    used_model,
+                } => {
+                    mark_condensed_backup_success(&mut trace, &used_model);
+                    return self.finish_condensed(response, true, trace).await;
+                }
+                CondensedBackupOutcome::Invalid {
+                    response,
+                    used_model,
+                    raw_output,
+                    validation_error,
+                    last_error,
+                } => {
+                    mark_condensed_backup_failure(&mut trace, &last_error, Some(&used_model));
+                    return self
+                        .repair_and_finish_condensed(
+                            response,
+                            true,
+                            raw_output,
+                            validation_error,
+                            trace,
+                        )
+                        .await;
+                }
+                CondensedBackupOutcome::Failed(source) => {
+                    mark_condensed_backup_failure(&mut trace, &source, None);
+                    return Err(CondensedGenerationError { source, trace });
+                }
+            }
+        }
+
+        let raw_output = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+        let validation_error = match normalize_structured_condensed_output(&raw_output) {
+            Ok(normalized) => {
+                if let Some(choice) = response.choices.first_mut() {
+                    choice.message.content = Some(normalized);
+                }
+                return self.finish_condensed(response, false, trace).await;
+            }
+            Err(error) => error,
+        };
+        trace.generation.primary_failed = true;
+        trace.generation.primary_failure_reason = validation_error.to_string();
+
+        let mut invalid_output = raw_output;
+        let mut content_source_is_backup = false;
+        if !self.condensed_backups.is_empty() {
+            trace.generation.backup_used = true;
+            match self.try_condensed_backups(&messages, &mut trace).await {
+                CondensedBackupOutcome::Valid {
+                    response,
+                    used_model,
+                } => {
+                    mark_condensed_backup_success(&mut trace, &used_model);
+                    return self.finish_condensed(response, true, trace).await;
+                }
+                CondensedBackupOutcome::Invalid {
+                    response: backup_response,
+                    used_model,
+                    raw_output,
+                    validation_error: _,
+                    last_error,
+                } => {
+                    response = backup_response;
+                    invalid_output = raw_output;
+                    content_source_is_backup = true;
+                    mark_condensed_backup_failure(&mut trace, &last_error, Some(&used_model));
+                }
+                CondensedBackupOutcome::Failed(last_error) => {
+                    mark_condensed_backup_failure(&mut trace, &last_error, None);
+                }
+            }
+        }
+
+        self.repair_and_finish_condensed(
+            response,
+            content_source_is_backup,
+            invalid_output,
+            validation_error,
+            trace,
+        )
+        .await
+    }
+
+    async fn try_condensed_backups(
+        &self,
+        messages: &[ChatCompletionRequestMessage],
+        _trace: &mut CondensedExecutionTrace,
+    ) -> CondensedBackupOutcome {
+        let mut last_error = anyhow::anyhow!("all backup condensed models failed");
+        let mut last_invalid = None;
+        for backup in &self.condensed_backups {
+            match self
+                .call_rich_completion(backup, messages.to_vec(), Some(0.7))
+                .await
+            {
+                Ok(mut response) => {
+                    let raw_output = response
+                        .choices
+                        .first()
+                        .and_then(|choice| choice.message.content.clone())
+                        .unwrap_or_default();
+                    match normalize_structured_condensed_output(&raw_output) {
+                        Ok(normalized) => {
+                            if let Some(choice) = response.choices.first_mut() {
+                                choice.message.content = Some(normalized);
+                            }
+                            let used_model = resolved_model(&response, backup);
+                            return CondensedBackupOutcome::Valid {
+                                response,
+                                used_model,
+                            };
+                        }
+                        Err(_error) if raw_output.trim().is_empty() => {
+                            last_error = anyhow::anyhow!("no content generated from backup model");
+                        }
+                        Err(error) => {
+                            let used_model = resolved_model(&response, backup);
+                            last_error = anyhow::anyhow!(error.to_string());
+                            last_invalid = Some((response, used_model, raw_output, error));
+                        }
+                    }
+                }
+                Err(error) => last_error = error,
+            }
+        }
+
+        if let Some((response, used_model, raw_output, validation_error)) = last_invalid {
+            CondensedBackupOutcome::Invalid {
+                response,
+                used_model,
+                raw_output,
+                validation_error,
+                last_error,
+            }
+        } else {
+            CondensedBackupOutcome::Failed(last_error)
+        }
+    }
+
+    async fn repair_and_finish_condensed(
+        &self,
+        mut response: CreateChatCompletionResponse,
+        content_source_is_backup: bool,
+        raw_output: String,
+        generation_error: anyhow::Error,
+        mut trace: CondensedExecutionTrace,
+    ) -> std::result::Result<CondensedResult, CondensedGenerationError> {
+        if raw_output.trim().is_empty() || self.check_model.is_none() {
+            return Err(CondensedGenerationError {
+                source: generation_error,
+                trace,
+            });
+        }
+
+        match self.repair_condensed_traced(&raw_output, &mut trace).await {
+            Ok(repaired) => {
+                if let Some(choice) = response.choices.first_mut() {
+                    choice.message.content = Some(repaired);
+                }
+                self.finish_condensed(response, content_source_is_backup, trace)
+                    .await
+            }
+            Err(source) => Err(CondensedGenerationError { source, trace }),
+        }
+    }
+
+    async fn repair_condensed_traced(
+        &self,
+        raw_output: &str,
+        trace: &mut CondensedExecutionTrace,
+    ) -> Result<String> {
+        trace.check.attempted = true;
+        let Some(check_model) = self.check_model.as_deref() else {
+            let source = anyhow::anyhow!("check model is not configured");
+            trace.check.failure_reason = source.to_string();
+            return Err(source);
+        };
+        let user_prompt =
+            CHECK_CONDENSED_OUTPUT_USER_PROMPT.replace("{{ .RawOutput }}", raw_output);
+        let messages = vec![
+            ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
+                content: CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT.into(),
+                name: None,
+            }),
+            ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+                content: ChatCompletionRequestUserMessageContent::Text(user_prompt),
+                name: None,
+            }),
+        ];
+
+        let primary_result = if self.force_check_failure {
+            Err(anyhow::anyhow!("check model forced failure via env switch"))
+        } else {
+            self.call_check_repair_once(check_model, &messages).await
+        };
+        match primary_result {
+            Ok((content, used_model)) => {
+                trace.check.succeeded = true;
+                trace.check.failure_reason.clear();
+                trace.check.generation.primary_used_model = used_model;
+                return Ok(content);
+            }
+            Err(error) => {
+                trace.check.generation.primary_failed = true;
+                trace.check.generation.primary_failure_reason = error.to_string();
+                if self.check_backups.is_empty() {
+                    trace.check.failure_reason = error.to_string();
+                    return Err(error);
+                }
+            }
+        }
+
+        trace.check.generation.backup_used = true;
+        let mut last_error = anyhow::anyhow!("all backup check models failed");
+        for backup in &self.check_backups {
+            match self.call_check_repair_once(backup, &messages).await {
+                Ok((content, used_model)) => {
+                    trace.check.succeeded = true;
+                    trace.check.failure_reason.clear();
+                    trace.check.generation.primary_used_model.clear();
+                    trace.check.generation.backup_used_model = used_model;
+                    trace.check.generation.backup_succeeded = true;
+                    trace.check.generation.backup_failure_reason.clear();
+                    return Ok(content);
+                }
+                Err(error) => {
+                    last_error = error;
+                    trace.check.generation.backup_failure_reason = last_error.to_string();
+                }
+            }
+        }
+        trace.check.generation.backup_succeeded = false;
+        trace.check.failure_reason = last_error.to_string();
+        Err(last_error)
+    }
+
+    async fn call_check_repair_once(
+        &self,
+        model: &str,
+        messages: &[ChatCompletionRequestMessage],
+    ) -> Result<(String, String)> {
+        let response = self
+            .call_rich_completion(model, messages.to_vec(), None)
+            .await?;
+        if response.choices.is_empty() {
+            return Err(anyhow::anyhow!("check model returned empty choices"));
+        }
+        let raw_output = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_deref())
+            .unwrap_or_default();
+        let content = normalize_structured_condensed_output(raw_output).map_err(|error| {
+            anyhow::anyhow!("check model returned invalid condensed output: {error}")
+        })?;
+        Ok((content, resolved_model(&response, model)))
+    }
+
+    async fn finish_condensed(
+        &self,
+        response: CreateChatCompletionResponse,
+        content_source_is_backup: bool,
+        mut trace: CondensedExecutionTrace,
+    ) -> std::result::Result<CondensedResult, CondensedGenerationError> {
+        let requested_model = if content_source_is_backup {
+            trace.generation.backup_used_model.as_str()
+        } else {
+            trace.generation.primary_model.as_str()
+        };
+        let used_model = resolved_model(&response, requested_model);
+        if content_source_is_backup {
+            trace.generation.primary_used_model.clear();
+            trace.generation.backup_used_model = used_model.clone();
+        } else {
+            trace.generation.primary_used_model = used_model.clone();
+        }
+        let content = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
+        let usage = token_usage(&response);
+        self.record_usage_nonfatal(SARCASTIC_CONDENSE_OPERATION, usage, &used_model)
+            .await;
+        Ok(CondensedResult { content, trace })
     }
 
     /// Sarcastic condensed single-sentence summary with emoji.
@@ -199,7 +931,7 @@ impl OpenAiClient {
             .model(&self.model)
             .messages(vec![
                 ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage {
-                    content: CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT.into(),
+                    content: LEGACY_STRUCTURED_SUMMARY_SYSTEM_PROMPT.into(),
                     name: None,
                 }),
                 ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -334,7 +1066,8 @@ impl OpenAiClient {
         }
         trace.attempted = true;
 
-        let user_prompt = CHECK_CONDENSED_OUTPUT_USER_PROMPT.replace("{{raw_output}}", raw_output);
+        let user_prompt =
+            CHECK_CONDENSED_OUTPUT_USER_PROMPT.replace("{{ .RawOutput }}", raw_output);
 
         // Try primary check model
         if let Ok(repaired) = self
@@ -580,6 +1313,89 @@ impl OpenAiClient {
             .map(|choice| choice.message.content.clone().unwrap_or_default())
             .collect())
     }
+}
+
+fn token_usage(response: &CreateChatCompletionResponse) -> TokenUsage {
+    let usage = response.usage.as_ref();
+    TokenUsage {
+        prompt_tokens: usage
+            .map(|usage| i64::from(usage.prompt_tokens))
+            .unwrap_or(0),
+        completion_tokens: usage
+            .map(|usage| i64::from(usage.completion_tokens))
+            .unwrap_or(0),
+        total_tokens: usage
+            .map(|usage| i64::from(usage.total_tokens))
+            .unwrap_or(0),
+    }
+}
+
+fn resolved_model(response: &CreateChatCompletionResponse, requested_model: &str) -> String {
+    if response.model.trim().is_empty() {
+        requested_model.to_string()
+    } else {
+        response.model.clone()
+    }
+}
+
+fn mark_condensed_backup_success(trace: &mut CondensedExecutionTrace, used_model: &str) {
+    trace.generation.backup_succeeded = true;
+    trace.generation.primary_used_model.clear();
+    trace.generation.backup_used_model = used_model.to_string();
+    trace.generation.backup_failure_reason.clear();
+}
+
+fn mark_condensed_backup_failure(
+    trace: &mut CondensedExecutionTrace,
+    error: &anyhow::Error,
+    used_model: Option<&str>,
+) {
+    trace.generation.backup_succeeded = false;
+    trace.generation.backup_failure_reason = error.to_string();
+    if let Some(used_model) = used_model {
+        trace.generation.backup_used_model = used_model.to_string();
+    }
+}
+
+fn normalize_structured_condensed_output(content: &str) -> Result<String> {
+    let candidate = content.trim();
+    anyhow::ensure!(!candidate.is_empty(), "no content generated");
+    anyhow::ensure!(
+        !candidate.contains("```"),
+        "condensed output contains code fence"
+    );
+    let parsed_json = serde_json::from_str::<serde_json::Value>(candidate).ok();
+    let json_container = matches!(
+        parsed_json,
+        Some(serde_json::Value::Object(_) | serde_json::Value::Array(_))
+    );
+    let bracketed = (candidate.starts_with('{') && candidate.ends_with('}'))
+        || (candidate.starts_with('[') && candidate.ends_with(']'));
+    anyhow::ensure!(
+        !json_container && !bracketed,
+        "condensed output is json-like"
+    );
+
+    let normalized = candidate.replace("\r\n", "\n").replace('\r', "\n");
+    let nonempty_lines = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        nonempty_lines.len() == 1,
+        "condensed output is not a single line"
+    );
+    let line = nonempty_lines[0];
+    anyhow::ensure!(
+        !line.starts_with('#'),
+        "condensed output contains a heading"
+    );
+    anyhow::ensure!(
+        !line.starts_with("- ") && !line.starts_with("* "),
+        "condensed output contains an unordered-list item"
+    );
+    Ok(line.to_string())
 }
 
 /// Check if condensed output is malformed and needs check model repair.

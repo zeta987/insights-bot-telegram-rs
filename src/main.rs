@@ -38,7 +38,10 @@ async fn run() -> Result<()> {
         &config.openai,
         &config.recap_openai,
         &config.condensed_prompts,
-    )?;
+    )?
+    .with_token_usage_recorder(Arc::new(
+        services::recap_generation::DatabaseTokenUsageRecorder::new(database.clone()),
+    ));
     // Allow 3 recap requests per minute per chat/user
     let limiter =
         services::rate_limit::CommandRateLimiter::new(3, std::time::Duration::from_secs(60));
