@@ -426,14 +426,18 @@ pub async fn handle_toggle_callback(
         let Some(state) = context.recap_state.as_deref() else {
             return edit_configuration(&bot, &callback, TOGGLE_ENABLE_STAGE_ERROR, None).await;
         };
-        queue_next_auto_recap(
+        if queue_next_auto_recap(
             state,
             data.chat_id,
             options.auto_recap_rates_per_day,
             context.config.timezone_shift_seconds,
             codec::now_unix_millis(),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            return edit_configuration(&bot, &callback, TOGGLE_ENABLE_STAGE_ERROR, None).await;
+        }
     } else if let Err(error) =
         feature_flags::disable_recap(&context.db, data.chat_id, chat_type, chat_title).await
     {
@@ -666,14 +670,18 @@ pub async fn handle_rates_callback(
     let Some(state) = context.recap_state.as_deref() else {
         return edit_configuration(&bot, &callback, RATE_STAGE_ERROR, None).await;
     };
-    queue_next_auto_recap(
+    if queue_next_auto_recap(
         state,
         data.chat_id,
         options.auto_recap_rates_per_day,
         context.config.timezone_shift_seconds,
         codec::now_unix_millis(),
     )
-    .await;
+    .await
+    .is_err()
+    {
+        return edit_configuration(&bot, &callback, RATE_STAGE_ERROR, None).await;
+    }
     let chat_title = message.chat.title().unwrap_or_default();
     let recap_enabled =
         match feature_flags::has_recap_enabled(&context.db, data.chat_id, chat_title).await {

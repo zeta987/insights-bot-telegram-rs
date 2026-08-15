@@ -1538,6 +1538,104 @@ impl RecapStateStore for FailingPutRecapStateStore {
     }
 }
 
+/// Delegates every call to the wrapped in-memory store but fails
+/// `auto_recap_zadd`, so the automatic-recap queue write breaks while
+/// callback routing, DB mutations, and keyboard rebuilds stay usable.
+struct FailingZaddRecapStateStore {
+    inner: Arc<InMemoryRecapStateStore>,
+}
+
+#[async_trait]
+impl RecapStateStore for FailingZaddRecapStateStore {
+    async fn put_callback(&self, route: &str, payload_json: &str) -> anyhow::Result<String> {
+        self.inner.put_callback(route, payload_json).await
+    }
+
+    async fn get_callback(&self, route: &str, action_hash: &str) -> anyhow::Result<Option<String>> {
+        self.inner.get_callback(route, action_hash).await
+    }
+
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> anyhow::Result<ManualRecapRateResult> {
+        self.inner
+            .check_manual_recap_rate(chat_id, rate, per_seconds)
+            .await
+    }
+
+    async fn put_start_context(
+        &self,
+        domain: keys::StartContextDomain,
+        token: &str,
+        json: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.put_start_context(domain, token, json).await
+    }
+
+    async fn get_start_context(
+        &self,
+        domain: keys::StartContextDomain,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.inner.get_start_context(domain, token).await
+    }
+
+    async fn forwarded_active(&self, user_id: i64) -> anyhow::Result<bool> {
+        self.inner.forwarded_active(user_id).await
+    }
+
+    async fn start_forwarded(&self, user_id: i64) -> anyhow::Result<()> {
+        self.inner.start_forwarded(user_id).await
+    }
+
+    async fn append_forwarded(
+        &self,
+        user_id: i64,
+        score_ms: i64,
+        json: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.append_forwarded(user_id, score_ms, json).await
+    }
+
+    async fn forwarded_batch(&self, user_id: i64) -> anyhow::Result<Vec<String>> {
+        self.inner.forwarded_batch(user_id).await
+    }
+
+    async fn cancel_forwarded(&self, user_id: i64) -> anyhow::Result<bool> {
+        self.inner.cancel_forwarded(user_id).await
+    }
+
+    async fn push_delete_later(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        message_id: i32,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .push_delete_later(user_id, chat_id, message_id)
+            .await
+    }
+
+    async fn drain_delete_later(&self, user_id: i64) -> anyhow::Result<Vec<(i64, i32)>> {
+        self.inner.drain_delete_later(user_id).await
+    }
+
+    async fn auto_recap_zadd(&self, _member: &str, _score_ms: i64) -> anyhow::Result<()> {
+        anyhow::bail!("simulated Redis failure while scheduling automatic recap")
+    }
+
+    async fn auto_recap_zpop_due(&self, now_ms: i64) -> anyhow::Result<Option<String>> {
+        self.inner.auto_recap_zpop_due(now_ms).await
+    }
+
+    async fn auto_recap_zrem(&self, member: &str) -> anyhow::Result<()> {
+        self.inner.auto_recap_zrem(member).await
+    }
+}
+
 /// Mount the bot-admin check, one actor membership result, and permissive
 /// `SendMessage`/`EditMessageText` sinks so wrong-branch responses are
 /// recorded instead of erroring out of the handler.
@@ -2070,6 +2168,107 @@ async fn rate_mutation_failure_edits_the_rate_stage_text() {
     assert_stage_edit(
         single_request(&requests, "/EditMessageText"),
         "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建回顾频率次数设定失败，请稍后再试！",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Automatic-recap queue write failures, ADR 0001 decision 2.
+//
+// Go surfaces a failed `QueueOneSendChatHistoriesRecapTaskForChatID` write
+// during toggle-enable or rate-change as that stage's `ExceptionError` edit
+// (`callback_query.go:170-177`, `callback_query.go:487-494`), matching every
+// other post-permission failure that passes the callback message to
+// `WithEdit`. The DB mutation always lands first; the queue write failing
+// afterward must not rebuild the keyboard or emit the success text.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn toggle_enable_queue_failure_edits_the_stage_specific_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_administrator_result(FROM_ID, false)).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let inner = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(inner.as_ref(), false, 1, 0).await;
+    let state = Arc::new(FailingZaddRecapStateStore {
+        inner: inner.clone(),
+    });
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("toggle callback with a failing automatic recap queue write");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    let edit = single_request(&requests, "/EditMessageText");
+    assert_stage_edit(
+        edit,
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能开启失败，请稍后再试！",
+    );
+    assert!(
+        request_body(edit).get("reply_markup").is_none(),
+        "the queue-write stage error is a bare edit with no keyboard"
+    );
+    assert!(
+        feature_flags::has_recap_enabled(&database, CHAT_ID, "Parity Lab")
+            .await
+            .expect("feature flag read"),
+        "the enable mutation lands before the automatic recap queue write fails"
+    );
+}
+
+#[tokio::test]
+async fn rates_queue_failure_edits_the_rate_stage_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let inner = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(inner.as_ref(), true, 5, 1).await;
+    let state = Arc::new(FailingZaddRecapStateStore {
+        inner: inner.clone(),
+    });
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("rates callback with a failing automatic recap queue write");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    let edit = single_request(&requests, "/EditMessageText");
+    assert_stage_edit(
+        edit,
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建回顾频率次数设定失败，请稍后再试！",
+    );
+    assert!(
+        request_body(edit).get("reply_markup").is_none(),
+        "the queue-write stage error is a bare edit with no keyboard"
+    );
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("options read")
+        .expect("options row");
+    assert_eq!(
+        options.auto_recap_rates_per_day, 3,
+        "the rate mutation lands before the automatic recap queue write fails"
     );
 }
 

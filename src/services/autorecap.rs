@@ -221,17 +221,22 @@ pub const fn has_enough_auto_recap_histories(history_count: usize) -> bool {
     history_count > 5
 }
 
-/// Calculate and enqueue the next slot while swallowing the queue failure.
+/// Calculate and enqueue the next slot, surfacing the queue failure to the
+/// caller.
 ///
-/// Go logs `BuryUtil` failures but returns nil to every caller, so the due time
-/// remains the only observable return value here.
+/// Go logs `BuryUtil` failures and, for the configure toggle-enable and
+/// rate-change callsites, propagates the failure into that stage's
+/// `ExceptionError` edit (ADR 0001 decision 2). The worker's requeue and
+/// startup seeding keep Go's log-and-continue handling by discarding the
+/// returned `Err`; this function still logs every failure so those callers
+/// need no additional logging of their own.
 pub async fn queue_next_auto_recap(
     state: &(impl RecapStateStore + ?Sized),
     chat_id: i64,
     rates_per_day: i64,
     timezone_shift_seconds: i64,
     now_utc_ms: i64,
-) -> i64 {
+) -> Result<i64> {
     let configured_rate = i32::try_from(rates_per_day).unwrap_or(4);
     let rate = effective_auto_recap_rate(configured_rate);
     let due_ms = next_auto_recap_at_ms(now_utc_ms, timezone_shift_seconds, rate);
@@ -241,19 +246,29 @@ pub async fn queue_next_auto_recap(
     )
     .await;
     match queued {
-        Ok(Ok(_)) => info!(chat_id, due_ms, "automatic recap scheduled"),
-        Ok(Err(source)) => error!(
-            chat_id,
-            due_ms,
-            error = %source,
-            "failed to enqueue automatic recap"
-        ),
-        Err(_) => error!(
-            chat_id,
-            due_ms, "automatic recap enqueue timed out after sixty seconds"
-        ),
+        Ok(Ok(_)) => {
+            info!(chat_id, due_ms, "automatic recap scheduled");
+            Ok(due_ms)
+        }
+        Ok(Err(source)) => {
+            error!(
+                chat_id,
+                due_ms,
+                error = %source,
+                "failed to enqueue automatic recap"
+            );
+            Err(source)
+        }
+        Err(_) => {
+            error!(
+                chat_id,
+                due_ms, "automatic recap enqueue timed out after sixty seconds"
+            );
+            Err(anyhow!(
+                "automatic recap enqueue timed out after sixty seconds"
+            ))
+        }
     }
-    due_ms
 }
 
 /// Read state, reproduce Go's error requeue, then perform the normal requeue.
@@ -274,7 +289,9 @@ where
             anyhow!("automatic recap state reads were exhausted and no usable options remained")
         })?;
         normalize_options_rate(options);
-        queue_next_auto_recap(
+        // Log-and-continue: the queue helper already logged the failure, and
+        // Go's error-side rescore ignores the write outcome too.
+        let _ = queue_next_auto_recap(
             state,
             chat_id,
             options.auto_recap_rates_per_day,
@@ -292,7 +309,9 @@ where
         .options
         .ok_or_else(|| anyhow!("automatic recap is enabled but its options row is unavailable"))?;
     normalize_options_rate(&mut options);
-    queue_next_auto_recap(
+    // Log-and-continue: matches Go's worker requeue, which never inspects the
+    // queue write outcome before proceeding to generation.
+    let _ = queue_next_auto_recap(
         state,
         chat_id,
         options.auto_recap_rates_per_day,
@@ -428,7 +447,9 @@ impl AutoRecapStartupSeeder for DatabaseAutoRecapStartupSeeder<'_> {
     }
 
     async fn queue_chat(&self, chat_id: i64, rates_per_day: i64) {
-        queue_next_auto_recap(
+        // Log-and-continue: matches Go's startup seeding, which never
+        // inspects the queue write outcome for the remaining seeded chats.
+        let _ = queue_next_auto_recap(
             self.state,
             chat_id,
             rates_per_day,
