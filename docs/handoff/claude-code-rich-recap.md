@@ -123,49 +123,65 @@ Relevant files:
 - `tests/autorecap_queue_tests.rs`
 - `tests/autorecap_delivery_tests.rs`
 
+The current configuration-error checkpoint ports Go's stage-specific
+`/configure_recap` failure behavior (`callback_query.go:95-641`):
+
+- Six post-permission failures call `WithEdit(c.Update.Message)` inside a
+  callback update, where that message is `nil`; `WithEdit(nil)` keeps no edit
+  target and `processExceptionError` falls through to a brand-new plain
+  `SendMessage` without keyboard, reply target, or parse mode. The branches
+  are toggle options lookup (`:149`), toggle keyboard rebuild (`:200`), mode
+  options reload (`:291`), rates options reload (`:478`), pin options lookup
+  (`:583`), and pin keyboard rebuild (`:625`).
+- The rates options reload keeps the configuration header plus
+  `每天自动创建回顾频率次数设定失败，请稍后再试！` on that new message; the toggle
+  and mode branches use the bare `暂时无法配置聊天记录回顾功能，请稍后再试！`; the
+  pin branches use the bare
+  `暂时无法配置聊天记录回顾消息置顶功能，请稍后再试！`. The earlier five-branch
+  note omitted the rates branch; the pinned Go source is authoritative.
+- Every other post-permission failure stays an `EditMessageText` with its
+  stage text: toggle enable and disable, mode mutation (general text), mode
+  feature lookup (`模式设定失败`), every remaining rate failure, and pin
+  enable/disable. The mode keyboard rebuild failure stays an edit because Go
+  passes the callback message there (`:313`).
+- The approved `find_one_or_create` replacement for Go's missing-options
+  nil-pointer crash is retained on toggle and pin.
+- `tests/recap_configure_tests.rs` now holds twenty-six tests; the thirteen
+  new ones inject failures with a closed pool, dropped tables, SQLite
+  corruption/RAISE triggers, and a `put_callback`-failing state store
+  wrapper.
+
 Latest verification before this handoff:
 
-- `cargo clippy --all-targets --all-features -- -D warnings` passed.
+- `cargo fmt --check` reports only the known `src/db/recap_config.rs` and
+  `src/services/recap.rs` baseline differences.
+- `cargo check --all-targets` and
+  `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
-- `/configure_recap` focused tests passed: 13.
+- `/configure_recap` focused tests passed: 26.
 - Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
+
+## Deferred parity decisions
+
+Two parity questions surfaced by the configuration-error checkpoint are
+deliberately deferred; get an explicit decision before acting on either:
+
+- Go `processExceptionError` never reads `replyMarkup` and its edit is a bare
+  `NewEditMessageText` without parse mode or keyboard, so every
+  `ExceptionError` edit in Go drops the keyboard from the wire payload
+  (`pkg/bots/tgbot/handler.go:117-156`, `response.go`). Rust's
+  `edit_configuration` re-attaches the existing keyboard, and the committed
+  expired-callback checkpoint asserts that retention. Do not switch those
+  edits to bare payloads without approval.
+- Go treats a failed `QueueOneSendChatHistoriesRecapTaskForChatID` as the
+  toggle-enable or rate stage error, but Rust's `queue_next_auto_recap`
+  swallows queue errors after logging, so those two Go branches are currently
+  unreachable. Surfacing them changes a shared signature used by the worker
+  and the startup seed.
 
 ## Next required slice
 
-Continue the read-only pinned-Go versus Rust audit of the completed automatic
-worker and configuration runtime; passing tests do not prove every error branch.
-The ordinary-member, creator-only, GroupAnonymousBot actor lookup, expired
-payload, toggle-off queue retention, disabled-rate-rescore, and two-phase
-startup seed and callback group-only branches are complete. Next verify
-the remaining configuration failure branches. The confirmed next RED matrix is:
-
-- Go selects stage-specific text for toggle options lookup, toggle enable or
-  disable, rate persistence, pin persistence, and keyboard Redis failure;
-  Rust currently collapses those paths into `APPLY_CONFIG_ERROR` or
-  `APPLY_PIN_ERROR`. Compare Go `callback_query.go:149-205,469-519,583-630`
-  with Rust `recap_configure.rs:385-433,623-677,743-787`.
-- Add a closed-pool database fixture plus a `RecapStateStore` whose
-  `put_callback` fails, then assert exact `EditMessageText.text`, parse mode,
-  and retained markup for each stage before changing production constants.
-- Exact Go text groups are: toggle options/keyboard
-  `暂时无法配置聊天记录回顾功能，请稍后再试！`; toggle mutation uses the header plus
-  `聊天记录回顾功能开启失败，请稍后再试！` or its `关闭失败` variant; mode
-  feature lookup uses the header plus `聊天记录回顾模式设定失败，请稍后再试！`,
-  while mode options/keyboard use the same temporary-unavailable text; every
-  post-permission rate failure uses the header plus
-  `每天自动创建回顾频率次数设定失败，请稍后再试！`; pin options/keyboard use
-  `暂时无法配置聊天记录回顾消息置顶功能，请稍后再试！`, while pin mutation uses
-  the header plus its `开启失败` or `关闭失败` variant.
-- Several pinned-Go failures call `WithEdit(c.Update.Message)` instead of the
-  callback message. This usually produces no callback edit; treat it as an
-  explicit compatibility decision and test it before changing Rust's current
-  callback-message edit target.
-- The safe `find_one_or_create` handling for missing toggle/pin options is an
-  approved bounded Rust replacement for pinned Go's nil-pointer crash and must
-  remain documented rather than reintroducing a process panic.
-
-After this matrix, use the parity ledger to select the next non-`/smr` Telegram
-gap. The next confirmed production wiring gap is bot-left cleanup:
+The next confirmed production wiring gap is bot-left cleanup:
 
 - Go registers `OnMyChatMember` in `welcome/welcome.go:56-65` and, only when
   `new_chat_member.status == left`, calls its best-effort five-step cleanup.
@@ -221,8 +237,8 @@ available, read its latest messages too. Then check `.git/index.lock`, current
 branch, latest signed commits, and the unstaged/staged diff without reading any
 `.env*` file. Preserve the completed automatic-recap checkpoint and continue
 the pinned Go v1.0.0 1:1 port from the audit and next-gap procedure described
-above. Begin with the stage-specific configuration failure RED matrix under
-`Next required slice`; do not broadly refactor its handlers. Do not redo
+above. Begin with the bot-left router wiring under `Next required slice`; do not
+broadly refactor existing handlers. Do not redo
 completed modules merely because their implementation is
 unfamiliar: compare production callsites and tests first. Use TDD, keep edits
 scoped, run focused plus full Rust verification, perform a staged secrets/PII

@@ -4,6 +4,7 @@ mod support;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use insights_bot_telegram_rs::{
     bot::{
         context::{AppContext, RecapRuntimeDependencies},
@@ -19,7 +20,7 @@ use insights_bot_telegram_rs::{
     i18n::I18n,
     redis::{
         keys,
-        recap_state::{InMemoryRecapStateStore, RecapStateStore, TestClock},
+        recap_state::{InMemoryRecapStateStore, ManualRecapRateResult, RecapStateStore, TestClock},
     },
     services::{
         autorecap_queue::encode_auto_recap_member,
@@ -1405,6 +1406,739 @@ async fn expired_toggle_edits_plain_error_and_preserves_the_existing_keyboard() 
         value => value.clone(),
     };
     assert_eq!(retained_markup, keyboard);
+}
+
+// ---------------------------------------------------------------------------
+// Stage-specific configuration failures, Go `callback_query.go:95-641`.
+//
+// Go routes every post-permission failure through `ExceptionError`. Six of
+// those branches call `WithEdit(c.Update.Message)`, and in a callback update
+// that message is `nil`: `WithEdit(nil)` is a silent no-op, so
+// `processExceptionError` falls through to a brand-new plain `SendMessage`
+// without keyboard, reply target, or parse mode. Every other branch passes the
+// callback message and stays an `EditMessageText` with its stage text.
+// ---------------------------------------------------------------------------
+
+/// Delegates every read to the wrapped in-memory store but fails each
+/// `put_callback`, so keyboard reconstruction breaks while the route lookup
+/// for the already-built configuration keyboard still resolves.
+struct FailingPutRecapStateStore {
+    inner: Arc<InMemoryRecapStateStore>,
+}
+
+#[async_trait]
+impl RecapStateStore for FailingPutRecapStateStore {
+    async fn put_callback(&self, _route: &str, _payload_json: &str) -> anyhow::Result<String> {
+        anyhow::bail!("simulated Redis failure while storing a callback payload")
+    }
+
+    async fn get_callback(&self, route: &str, action_hash: &str) -> anyhow::Result<Option<String>> {
+        self.inner.get_callback(route, action_hash).await
+    }
+
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> anyhow::Result<ManualRecapRateResult> {
+        self.inner
+            .check_manual_recap_rate(chat_id, rate, per_seconds)
+            .await
+    }
+
+    async fn put_start_context(
+        &self,
+        domain: keys::StartContextDomain,
+        token: &str,
+        json: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.put_start_context(domain, token, json).await
+    }
+
+    async fn get_start_context(
+        &self,
+        domain: keys::StartContextDomain,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.inner.get_start_context(domain, token).await
+    }
+
+    async fn forwarded_active(&self, user_id: i64) -> anyhow::Result<bool> {
+        self.inner.forwarded_active(user_id).await
+    }
+
+    async fn start_forwarded(&self, user_id: i64) -> anyhow::Result<()> {
+        self.inner.start_forwarded(user_id).await
+    }
+
+    async fn append_forwarded(
+        &self,
+        user_id: i64,
+        score_ms: i64,
+        json: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.append_forwarded(user_id, score_ms, json).await
+    }
+
+    async fn forwarded_batch(&self, user_id: i64) -> anyhow::Result<Vec<String>> {
+        self.inner.forwarded_batch(user_id).await
+    }
+
+    async fn cancel_forwarded(&self, user_id: i64) -> anyhow::Result<bool> {
+        self.inner.cancel_forwarded(user_id).await
+    }
+
+    async fn push_delete_later(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        message_id: i32,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .push_delete_later(user_id, chat_id, message_id)
+            .await
+    }
+
+    async fn drain_delete_later(&self, user_id: i64) -> anyhow::Result<Vec<(i64, i32)>> {
+        self.inner.drain_delete_later(user_id).await
+    }
+
+    async fn auto_recap_zadd(&self, member: &str, score_ms: i64) -> anyhow::Result<()> {
+        self.inner.auto_recap_zadd(member, score_ms).await
+    }
+
+    async fn auto_recap_zpop_due(&self, now_ms: i64) -> anyhow::Result<Option<String>> {
+        self.inner.auto_recap_zpop_due(now_ms).await
+    }
+
+    async fn auto_recap_zrem(&self, member: &str) -> anyhow::Result<()> {
+        self.inner.auto_recap_zrem(member).await
+    }
+}
+
+/// Mount the bot-admin check, one actor membership result, and permissive
+/// `SendMessage`/`EditMessageText` sinks so wrong-branch responses are
+/// recorded instead of erroring out of the handler.
+async fn mount_callback_stage_mocks(server: &MockServer, actor_result: Value) {
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(actor_result))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(server)
+        .await;
+}
+
+/// Build the configuration keyboard against `state` and return one wire value.
+async fn built_wire(
+    state: &InMemoryRecapStateStore,
+    recap_enabled: bool,
+    row: usize,
+    column: usize,
+) -> String {
+    let keyboard = build_configure_keyboard(
+        state,
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    keyboard["inline_keyboard"][row][column]["callback_data"]
+        .as_str()
+        .expect("callback wire")
+        .to_owned()
+}
+
+fn suffix_count(requests: &[wiremock::Request], suffix: &str) -> usize {
+    requests
+        .iter()
+        .filter(|request| request.url.path().ends_with(suffix))
+        .count()
+}
+
+fn single_request<'a>(requests: &'a [wiremock::Request], suffix: &str) -> &'a wiremock::Request {
+    let matching = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with(suffix))
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "exactly one {suffix} request expected");
+    matching[0]
+}
+
+/// Go `processExceptionError` fallback: a brand-new plain message.
+fn assert_plain_new_message(request: &wiremock::Request, text: &str) {
+    let body = request_body(request);
+    assert_eq!(body["text"], text);
+    assert_eq!(body["chat_id"], CHAT_ID);
+    assert!(
+        body.get("parse_mode").is_none(),
+        "Go's fallback message has no parse mode"
+    );
+    assert!(
+        body.get("reply_markup").is_none(),
+        "Go's fallback message has no keyboard"
+    );
+    assert!(
+        body.get("reply_parameters").is_none(),
+        "Go's fallback message is not a reply"
+    );
+}
+
+/// A stage-text `ExceptionError` edit of the configuration message.
+fn assert_stage_edit(request: &wiremock::Request, text: &str) {
+    let body = request_body(request);
+    assert_eq!(body["text"], text);
+    assert_eq!(body["message_id"], 88);
+    assert!(
+        body.get("parse_mode").is_none(),
+        "stage errors are plain-text edits"
+    );
+}
+
+#[tokio::test]
+async fn toggle_options_lookup_failure_sends_a_plain_new_message() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_administrator_result(FROM_ID, false)).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), false, 1, 0).await;
+    let context = command_context(&server, database.clone(), state).await;
+    database.pool.close().await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("toggle callback with a failing options lookup");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        suffix_count(&requests, "/EditMessageText"),
+        0,
+        "Go WithEdit(nil) never edits the callback message"
+    );
+    assert_plain_new_message(
+        single_request(&requests, "/SendMessage"),
+        "暂时无法配置聊天记录回顾功能，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn toggle_keyboard_failure_sends_a_plain_new_message_after_the_mutation() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_administrator_result(FROM_ID, false)).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let inner = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(inner.as_ref(), false, 1, 0).await;
+    let state = Arc::new(FailingPutRecapStateStore {
+        inner: inner.clone(),
+    });
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("toggle callback with a failing keyboard rebuild");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/EditMessageText"), 0);
+    assert_plain_new_message(
+        single_request(&requests, "/SendMessage"),
+        "暂时无法配置聊天记录回顾功能，请稍后再试！",
+    );
+    assert!(
+        feature_flags::has_recap_enabled(&database, CHAT_ID, "Parity Lab")
+            .await
+            .expect("feature flag read"),
+        "the enable mutation lands before the keyboard rebuild fails"
+    );
+}
+
+#[tokio::test]
+async fn mode_options_lookup_failure_sends_a_plain_new_message() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    // The mode update trips this trigger, which corrupts the row so only the
+    // handler's follow-up options reload fails while the mutation succeeds.
+    sqlx::query(
+        "CREATE TRIGGER poison_recap_options
+             AFTER UPDATE OF auto_recap_send_mode ON telegram_chat_recaps_options
+         BEGIN
+             UPDATE telegram_chat_recaps_options
+                 SET pin_auto_recap_message = 'poisoned'
+                 WHERE chat_id = NEW.chat_id;
+         END",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("options poison trigger");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), false, 3, 1).await;
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("mode callback with a failing options reload");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/EditMessageText"), 0);
+    assert_plain_new_message(
+        single_request(&requests, "/SendMessage"),
+        "暂时无法配置聊天记录回顾功能，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn rates_options_lookup_failure_sends_the_rate_stage_text_as_a_new_message() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    sqlx::query(
+        "CREATE TRIGGER poison_recap_options
+             AFTER UPDATE OF auto_recap_rates_per_day ON telegram_chat_recaps_options
+         BEGIN
+             UPDATE telegram_chat_recaps_options
+                 SET pin_auto_recap_message = 'poisoned'
+                 WHERE chat_id = NEW.chat_id;
+         END",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("options poison trigger");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), true, 5, 0).await;
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("rates callback with a failing options reload");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/EditMessageText"), 0);
+    // Unlike the other nil-edit branches, Go keeps the configuration header
+    // and the rate stage text on this new message.
+    assert_plain_new_message(
+        single_request(&requests, "/SendMessage"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建回顾频率次数设定失败，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn pin_options_lookup_failure_sends_a_plain_new_message() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), true, 7, 0).await;
+    let context = command_context(&server, database.clone(), state).await;
+    database.pool.close().await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("pin callback with a failing options lookup");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/EditMessageText"), 0);
+    assert_plain_new_message(
+        single_request(&requests, "/SendMessage"),
+        "暂时无法配置聊天记录回顾消息置顶功能，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn pin_keyboard_failure_sends_a_plain_new_message_after_the_mutation() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    let inner = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(inner.as_ref(), true, 7, 0).await;
+    let state = Arc::new(FailingPutRecapStateStore {
+        inner: inner.clone(),
+    });
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("pin callback with a failing keyboard rebuild");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/EditMessageText"), 0);
+    assert_plain_new_message(
+        single_request(&requests, "/SendMessage"),
+        "暂时无法配置聊天记录回顾消息置顶功能，请稍后再试！",
+    );
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("options read")
+        .expect("options row");
+    assert!(
+        options.pin_auto_recap_message,
+        "the pin mutation lands before the keyboard rebuild fails"
+    );
+}
+
+#[tokio::test]
+async fn mode_keyboard_failure_edits_with_the_bare_unavailable_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    let inner = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(inner.as_ref(), false, 3, 1).await;
+    let state = Arc::new(FailingPutRecapStateStore {
+        inner: inner.clone(),
+    });
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("mode callback with a failing keyboard rebuild");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    // Go passes the callback message to WithEdit here, so unlike the toggle
+    // and pin keyboard failures this stays an edit.
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "暂时无法配置聊天记录回顾功能，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn toggle_enable_failure_edits_the_stage_specific_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_administrator_result(FROM_ID, false)).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    sqlx::query("DROP TABLE telegram_chat_feature_flags")
+        .execute(&database.pool)
+        .await
+        .expect("drop the feature flag table");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), false, 1, 0).await;
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("toggle callback with a failing enable mutation");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能开启失败，请稍后再试！",
+    );
+    assert!(
+        recap_options::find_one(&database, CHAT_ID)
+            .await
+            .expect("options read")
+            .is_some(),
+        "the options row is materialised before the enable mutation fails"
+    );
+}
+
+#[tokio::test]
+async fn toggle_disable_failure_edits_the_stage_specific_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_administrator_result(FROM_ID, false)).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    sqlx::query("DROP TABLE telegram_chat_feature_flags")
+        .execute(&database.pool)
+        .await
+        .expect("drop the feature flag table");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), false, 1, 1).await;
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("toggle callback with a failing disable mutation");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能关闭失败，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn mode_feature_lookup_failure_edits_the_stage_specific_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    sqlx::query("DROP TABLE telegram_chat_feature_flags")
+        .execute(&database.pool)
+        .await
+        .expect("drop the feature flag table");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), false, 3, 1).await;
+    let context = command_context(&server, database.clone(), state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("mode callback with a failing feature lookup");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾模式设定失败，请稍后再试！",
+    );
+    let options = recap_options::find_one(&database, CHAT_ID)
+        .await
+        .expect("options read")
+        .expect("options row");
+    assert_eq!(
+        options.auto_recap_send_mode, 1,
+        "the mode mutation lands before the feature lookup fails"
+    );
+}
+
+#[tokio::test]
+async fn rate_mutation_failure_edits_the_rate_stage_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), true, 5, 1).await;
+    let context = command_context(&server, database.clone(), state).await;
+    database.pool.close().await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("rates callback with a failing rate mutation");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建回顾频率次数设定失败，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn pin_enable_failure_edits_the_pin_stage_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    sqlx::query(
+        "CREATE TRIGGER block_pin_update
+             BEFORE UPDATE OF pin_auto_recap_message ON telegram_chat_recaps_options
+         BEGIN
+             SELECT RAISE(ABORT, 'pin update blocked');
+         END",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("pin update trigger");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), true, 7, 0).await;
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("pin callback with a failing enable mutation");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾消息置顶功能开启失败，请稍后再试！",
+    );
+}
+
+#[tokio::test]
+async fn pin_disable_failure_edits_the_pin_stage_text() {
+    let server = MockServer::start().await;
+    mount_callback_stage_mocks(&server, telegram_owner_result()).await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    recap_options::find_one_or_create(&database, CHAT_ID)
+        .await
+        .expect("seed recap options");
+    recap_options::set_pin_enabled(&database, CHAT_ID)
+        .await
+        .expect("seed pin enabled");
+    sqlx::query(
+        "CREATE TRIGGER block_pin_update
+             BEFORE UPDATE OF pin_auto_recap_message ON telegram_chat_recaps_options
+         BEGIN
+             SELECT RAISE(ABORT, 'pin update blocked');
+         END",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("pin update trigger");
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let wire = built_wire(state.as_ref(), true, 7, 1).await;
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback(&wire),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("pin callback with a failing disable mutation");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(suffix_count(&requests, "/SendMessage"), 0);
+    assert_stage_edit(
+        single_request(&requests, "/EditMessageText"),
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾消息置顶功能关闭失败，请稍后再试！",
+    );
 }
 
 #[tokio::test]

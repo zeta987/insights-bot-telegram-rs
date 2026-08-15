@@ -36,6 +36,16 @@ const CALLBACK_BOT_ADMIN_REQUIRED: &str = "好的。请在下面点击你想配�
 const CALLBACK_GROUP_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，聊天记录回顾功能只有<b>群组</b>和<b>超级群组</b>的管理员可以配置哦！\n请将 Bot 添加到群组中，并配置 Bot 为管理员后使用管理员权限的用户账户为 Bot 进行配置吧。";
 const CREATOR_MODE_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，抱歉，此操作无法进行，只有<b>群组创建者</b>角色可以配置聊天记录回顾的模式。";
 const APPLY_PIN_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾消息置顶功能的配置时出现了问题，请稍后再试！";
+const PIN_UNAVAILABLE: &str = "暂时无法配置聊天记录回顾消息置顶功能，请稍后再试！";
+const TOGGLE_ENABLE_STAGE_ERROR: &str =
+    "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能开启失败，请稍后再试！";
+const TOGGLE_DISABLE_STAGE_ERROR: &str =
+    "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能关闭失败，请稍后再试！";
+const MODE_STAGE_ERROR: &str =
+    "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾模式设定失败，请稍后再试！";
+const RATE_STAGE_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n每天自动创建回顾频率次数设定失败，请稍后再试！";
+const PIN_ENABLE_STAGE_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾消息置顶功能开启失败，请稍后再试！";
+const PIN_DISABLE_STAGE_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾消息置顶功能关闭失败，请稍后再试！";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreatorOnlyPermission {
@@ -320,6 +330,22 @@ async fn edit_configuration_html(
     Ok(())
 }
 
+/// Go `processExceptionError`'s fallback for `WithEdit(c.Update.Message)`: the
+/// plain `Update.Message` is `nil` inside a callback update, so `WithEdit`
+/// silently keeps no edit target and the error surfaces as a brand-new plain
+/// message without keyboard, reply target, or parse mode.
+async fn send_plain_configuration_error(
+    bot: &Bot,
+    callback: &CallbackQuery,
+    text: &str,
+) -> ResponseResult<()> {
+    let Some(message) = callback.message.as_ref() else {
+        return Ok(());
+    };
+    bot.send_message(message.chat().id, text).await?;
+    Ok(())
+}
+
 /// Apply Go's recap feature toggle. Enabling creates a usable options row and
 /// schedules the deterministic TimeCapsule member; disabling leaves any queued
 /// member untouched until the worker pops it and observes the disabled flag.
@@ -382,37 +408,39 @@ pub async fn handle_toggle_callback(
         "supergroup"
     };
     let chat_title = message.chat.title().unwrap_or_default();
-    let result = async {
-        let options = recap_options::find_one_or_create(&context.db, data.chat_id).await?;
-        if data.status {
-            feature_flags::enable_recap(&context.db, data.chat_id, chat_type, chat_title).await?;
-            let state = context
-                .recap_state
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("recap state is unavailable"))?;
-            queue_next_auto_recap(
-                state,
-                data.chat_id,
-                options.auto_recap_rates_per_day,
-                context.config.timezone_shift_seconds,
-                codec::now_unix_millis(),
-            )
-            .await;
-        } else {
-            feature_flags::disable_recap(&context.db, data.chat_id, chat_type, chat_title).await?;
-        }
-        Result::<_, anyhow::Error>::Ok(options)
-    }
-    .await;
-    let options = match result {
+    let options = match recap_options::find_one_or_create(&context.db, data.chat_id).await {
         Ok(options) => options,
         Err(error) => {
-            error!(?error, "failed to apply recap toggle");
-            return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+            error!(?error, "failed to load recap options for toggle");
+            return send_plain_configuration_error(&bot, &callback, CONFIGURE_UNAVAILABLE).await;
         }
     };
+    if data.status {
+        if let Err(error) =
+            feature_flags::enable_recap(&context.db, data.chat_id, chat_type, chat_title).await
+        {
+            error!(?error, "failed to enable the recap feature");
+            return edit_configuration(&bot, &callback, TOGGLE_ENABLE_STAGE_ERROR, None).await;
+        }
+        let Some(state) = context.recap_state.as_deref() else {
+            return edit_configuration(&bot, &callback, TOGGLE_ENABLE_STAGE_ERROR, None).await;
+        };
+        queue_next_auto_recap(
+            state,
+            data.chat_id,
+            options.auto_recap_rates_per_day,
+            context.config.timezone_shift_seconds,
+            codec::now_unix_millis(),
+        )
+        .await;
+    } else if let Err(error) =
+        feature_flags::disable_recap(&context.db, data.chat_id, chat_type, chat_title).await
+    {
+        error!(?error, "failed to disable the recap feature");
+        return edit_configuration(&bot, &callback, TOGGLE_DISABLE_STAGE_ERROR, None).await;
+    }
     let Some(state) = context.recap_state.as_deref() else {
-        return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+        return send_plain_configuration_error(&bot, &callback, CONFIGURE_UNAVAILABLE).await;
     };
     let keyboard = match build_configure_keyboard(
         state,
@@ -430,7 +458,7 @@ pub async fn handle_toggle_callback(
         Ok(keyboard) => keyboard,
         Err(error) => {
             error!(?error, "failed to rebuild recap toggle keyboard");
-            return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+            return send_plain_configuration_error(&bot, &callback, CONFIGURE_UNAVAILABLE).await;
         }
     };
     let text = if data.status {
@@ -518,7 +546,7 @@ pub async fn handle_assign_mode_callback(
                     ?error,
                     "failed to reload recap feature status after mode update"
                 );
-                return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+                return edit_configuration(&bot, &callback, MODE_STAGE_ERROR, None).await;
             }
         };
     let options = match recap_options::find_one(&context.db, data.chat_id).await {
@@ -526,11 +554,11 @@ pub async fn handle_assign_mode_callback(
         Ok(None) => return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await,
         Err(error) => {
             error!(?error, "failed to reload recap options after mode update");
-            return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+            return send_plain_configuration_error(&bot, &callback, CONFIGURE_UNAVAILABLE).await;
         }
     };
     let Some(state) = context.recap_state.as_deref() else {
-        return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+        return edit_configuration(&bot, &callback, CONFIGURE_UNAVAILABLE, None).await;
     };
     let keyboard = match build_configure_keyboard(
         state,
@@ -548,7 +576,7 @@ pub async fn handle_assign_mode_callback(
         Ok(keyboard) => keyboard,
         Err(error) => {
             error!(?error, "failed to rebuild recap mode keyboard");
-            return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+            return edit_configuration(&bot, &callback, CONFIGURE_UNAVAILABLE, None).await;
         }
     };
     let text = if data.mode == AutoRecapSendMode::Publicly.as_stored() {
@@ -624,18 +652,18 @@ pub async fn handle_rates_callback(
         recap_options::set_rates_per_day(&context.db, data.chat_id, data.rates).await
     {
         error!(?error, "failed to store recap daily rate");
-        return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+        return edit_configuration(&bot, &callback, RATE_STAGE_ERROR, None).await;
     }
     let options = match recap_options::find_one(&context.db, data.chat_id).await {
         Ok(Some(options)) => options,
         Ok(None) => return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await,
         Err(error) => {
             error!(?error, "failed to reload recap options after rate update");
-            return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+            return send_plain_configuration_error(&bot, &callback, RATE_STAGE_ERROR).await;
         }
     };
     let Some(state) = context.recap_state.as_deref() else {
-        return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+        return edit_configuration(&bot, &callback, RATE_STAGE_ERROR, None).await;
     };
     queue_next_auto_recap(
         state,
@@ -654,7 +682,7 @@ pub async fn handle_rates_callback(
                     ?error,
                     "failed to reload recap feature status after rate update"
                 );
-                return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+                return edit_configuration(&bot, &callback, RATE_STAGE_ERROR, None).await;
             }
         };
     let keyboard = match build_configure_keyboard(
@@ -673,7 +701,7 @@ pub async fn handle_rates_callback(
         Ok(keyboard) => keyboard,
         Err(error) => {
             error!(?error, "failed to rebuild recap rate keyboard");
-            return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
+            return edit_configuration(&bot, &callback, RATE_STAGE_ERROR, None).await;
         }
     };
     let schedule = match data.rates {
@@ -746,12 +774,12 @@ pub async fn handle_pin_callback(
             Ok(options) => options,
             Err(error) => {
                 error!(?error, "failed to create recap options for pin update");
-                return edit_configuration(&bot, &callback, APPLY_PIN_ERROR, None).await;
+                return send_plain_configuration_error(&bot, &callback, PIN_UNAVAILABLE).await;
             }
         },
         Err(error) => {
             error!(?error, "failed to load recap options before pin update");
-            return edit_configuration(&bot, &callback, APPLY_PIN_ERROR, None).await;
+            return send_plain_configuration_error(&bot, &callback, PIN_UNAVAILABLE).await;
         }
     };
     let updated = if data.status {
@@ -761,10 +789,15 @@ pub async fn handle_pin_callback(
     };
     if let Err(error) = updated {
         error!(?error, "failed to store recap pin option");
-        return edit_configuration(&bot, &callback, APPLY_PIN_ERROR, None).await;
+        let text = if data.status {
+            PIN_ENABLE_STAGE_ERROR
+        } else {
+            PIN_DISABLE_STAGE_ERROR
+        };
+        return edit_configuration(&bot, &callback, text, None).await;
     }
     let Some(state) = context.recap_state.as_deref() else {
-        return edit_configuration(&bot, &callback, APPLY_PIN_ERROR, None).await;
+        return send_plain_configuration_error(&bot, &callback, PIN_UNAVAILABLE).await;
     };
     let keyboard = match build_configure_keyboard(
         state,
@@ -783,7 +816,7 @@ pub async fn handle_pin_callback(
         Ok(keyboard) => keyboard,
         Err(error) => {
             error!(?error, "failed to rebuild recap pin keyboard");
-            return edit_configuration(&bot, &callback, APPLY_PIN_ERROR, None).await;
+            return send_plain_configuration_error(&bot, &callback, PIN_UNAVAILABLE).await;
         }
     };
     let text = if data.status {
