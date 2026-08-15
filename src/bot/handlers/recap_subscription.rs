@@ -586,7 +586,7 @@ pub async fn handle_unsubscribe_callback(
         Ok(data) => data,
         Err(source) => {
             error!(?source, "failed to decode unsubscribe callback payload");
-            edit_unsubscribe_error(&bot, message, current_markup).await;
+            edit_unsubscribe_error(&bot, message).await;
             return Ok(());
         }
     };
@@ -599,7 +599,7 @@ pub async fn handle_unsubscribe_callback(
     }
     if let Err(source) = subscribers::unsubscribe(&context.db, data.chat_id, from_id).await {
         error!(?source, "failed to unsubscribe from callback");
-        edit_unsubscribe_error(&bot, message, current_markup).await;
+        edit_unsubscribe_error(&bot, message).await;
         return Ok(());
     }
 
@@ -744,18 +744,18 @@ fn empty_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(Vec::<Vec<InlineKeyboardButton>>::new())
 }
 
-async fn edit_unsubscribe_error(
-    bot: &Bot,
-    message: &teloxide::types::MaybeInaccessibleMessage,
-    markup: InlineKeyboardMarkup,
-) {
+/// Go `processExceptionError` (`pkg/bots/tgbot/handler.go:117-156`) ignores
+/// `ExceptionError.replyMarkup` entirely for the edit branch and only ever
+/// calls `NewEditMessageText(chatID, editMessage.MessageID, message)`, so the
+/// callback_query.go:381-400 `WithReplyMarkup(...)` calls are dead code. The
+/// wire edit here must stay bare: no reply markup, no parse mode.
+async fn edit_unsubscribe_error(bot: &Bot, message: &teloxide::types::MaybeInaccessibleMessage) {
     if let Err(source) = bot
         .edit_message_text(
             message.chat().id,
             message.id(),
             "取消订阅时出现了问题，请稍后再试！",
         )
-        .reply_markup(markup)
         .await
     {
         warn!(?source, "failed to edit unsubscribe callback error");

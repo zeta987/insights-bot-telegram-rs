@@ -1446,6 +1446,18 @@ async fn dispatcher_malformed_wire_sends_the_go_generic_invalid_action_text() {
     let body = request_body(&requests[0]);
     assert_eq!(body["message_id"], 202);
     assert_eq!(body["text"], GO_GENERIC_INVALID_ACTION_TEXT);
+    // Go builds this fallback with the raw `tgbotapi.NewEditMessageText(...)`
+    // helper (`pkg/bots/tgbot/dispatcher.go:225`), never calling
+    // `.WithInlineReplyMarkup(...)` or setting a parse mode, so the wire edit
+    // stays bare.
+    assert!(
+        body.get("parse_mode").is_none(),
+        "Go's generic dispatcher edit has no parse mode"
+    );
+    assert!(
+        body.get("reply_markup").is_none(),
+        "Go's generic dispatcher edit has no keyboard"
+    );
 }
 
 /// #15b: a well-formed wire whose route hash matches no registered route

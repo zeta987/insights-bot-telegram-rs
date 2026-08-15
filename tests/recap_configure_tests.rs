@@ -1157,7 +1157,7 @@ async fn administrators_receive_go_creator_only_error_for_mode_rate_and_pin() {
     for wire in wires {
         RecapHandlers::handle_callback_query_with_me(
             context.config.telegram.bot(),
-            configure_callback(wire.as_str().expect("callback wire")),
+            configure_callback_with_markup(wire.as_str().expect("callback wire"), &keyboard),
             bot_me(),
             context.clone(),
         )
@@ -1179,11 +1179,23 @@ async fn administrators_receive_go_creator_only_error_for_mode_rate_and_pin() {
         .filter(|request| request.url.path().ends_with("/EditMessageText"))
         .collect::<Vec<_>>();
     assert_eq!(edits.len(), 3);
+    // Go `processMessageError` (`pkg/bots/tgbot/handler.go:43-115`) reads
+    // `MessageError.replyMarkup`/`parseMode` and re-applies them on the edit,
+    // unlike the bare `ExceptionError` edits above. Lock in that this
+    // creator-only edit — an HTML `MessageError` — keeps the caller's
+    // keyboard, marking the boundary between the two error classes.
     for edit in edits {
+        let body = request_body(edit);
         assert_eq!(
-            request_body(edit)["text"],
+            body["text"],
             "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，抱歉，此操作无法进行，只有<b>群组创建者</b>角色可以配置聊天记录回顾的模式。"
         );
+        assert_eq!(body["parse_mode"], "HTML");
+        let retained_markup: Value = match &body["reply_markup"] {
+            Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+            value => value.clone(),
+        };
+        assert_eq!(retained_markup, keyboard);
     }
 }
 
@@ -1349,8 +1361,15 @@ async fn anonymous_original_command_bypasses_complete_payload_actor_binding() {
     .expect("anonymous-origin complete callback");
 }
 
+/// Go `processExceptionError` (`pkg/bots/tgbot/handler.go:117-156`) builds the
+/// `ExceptionError` edit branch as a bare `NewEditMessageText(chatID,
+/// editMessage.MessageID, message)`: it never reads `ExceptionError.replyMarkup`
+/// or applies a parse mode, even though the callback_query.go call sites pass
+/// `WithReplyMarkup(...)`. The incoming message here still carries a keyboard,
+/// so this locks in that the wire edit drops it rather than falling back to
+/// reusing it.
 #[tokio::test]
-async fn expired_toggle_edits_plain_error_and_preserves_the_existing_keyboard() {
+async fn expired_toggle_edits_a_bare_wire_error_dropping_the_existing_keyboard() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/telegram/bottest-token/EditMessageText"))
@@ -1400,12 +1419,14 @@ async fn expired_toggle_edits_plain_error_and_preserves_the_existing_keyboard() 
         edit["text"],
         "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾功能的配置时出现了问题，请稍后再试！"
     );
-    assert!(edit.get("parse_mode").is_none());
-    let retained_markup: Value = match &edit["reply_markup"] {
-        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
-        value => value.clone(),
-    };
-    assert_eq!(retained_markup, keyboard);
+    assert!(
+        edit.get("parse_mode").is_none(),
+        "Go's ExceptionError edit has no parse mode"
+    );
+    assert!(
+        edit.get("reply_markup").is_none(),
+        "Go's ExceptionError edit never reads replyMarkup and drops the existing keyboard"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -1533,8 +1533,14 @@ async fn disabled_subscription_tracks_only_the_group_error_response() {
     );
 }
 
+/// Go `processExceptionError` (`pkg/bots/tgbot/handler.go:117-156`) builds the
+/// `ExceptionError` edit branch as a bare `NewEditMessageText(chatID,
+/// editMessage.MessageID, message)`: it never reads `ExceptionError.replyMarkup`,
+/// even though `callback_query.go:381-400`'s `handleCallbackQueryUnsubscribe`
+/// calls `WithReplyMarkup(...)`. This locks in that the wire edit drops the
+/// existing subscriber keyboard rather than preserving it.
 #[tokio::test]
-async fn expired_inline_unsubscribe_edits_error_and_preserves_all_buttons() {
+async fn expired_inline_unsubscribe_edits_a_bare_wire_error_dropping_all_buttons() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/telegram/bottest-token/EditMessageText"))
@@ -1592,11 +1598,14 @@ async fn expired_inline_unsubscribe_edits_error_and_preserves_all_buttons() {
     let requests = server.received_requests().await.expect("Telegram request");
     let edit = request_body(&requests[0]);
     assert_eq!(edit["text"], "取消订阅时出现了问题，请稍后再试！");
-    let preserved: Value = match &edit["reply_markup"] {
-        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
-        value => value.clone(),
-    };
-    assert_eq!(preserved, markup_value);
+    assert!(
+        edit.get("parse_mode").is_none(),
+        "Go's ExceptionError edit has no parse mode"
+    );
+    assert!(
+        edit.get("reply_markup").is_none(),
+        "Go's ExceptionError edit never reads replyMarkup and drops the existing keyboard"
+    );
 }
 
 #[tokio::test]

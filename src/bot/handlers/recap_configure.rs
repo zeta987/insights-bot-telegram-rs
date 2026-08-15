@@ -282,6 +282,13 @@ async fn check_creator_only_permission(
     }
 }
 
+/// Go `processExceptionError` (`pkg/bots/tgbot/handler.go:117-156`) builds this
+/// edit branch as a bare `NewEditMessageText(chatID, editMessage.MessageID,
+/// message)`: it never reads `ExceptionError.replyMarkup` or applies a parse
+/// mode. Unlike `edit_configuration_html` below (which serves the
+/// `MessageError` class via `processMessageError`), this must stay a wire-bare
+/// edit when no keyboard is explicitly supplied — no fallback reuse of the
+/// message's existing reply markup.
 async fn edit_configuration(
     bot: &Bot,
     callback: &CallbackQuery,
@@ -292,12 +299,6 @@ async fn edit_configuration(
         return Ok(());
     };
     let mut request = bot.edit_message_text(message.chat().id, message.id(), text);
-    let markup = markup.or_else(|| {
-        message
-            .regular_message()
-            .and_then(Message::reply_markup)
-            .cloned()
-    });
     if let Some(markup) = markup {
         request = request.reply_markup(markup);
     }
