@@ -83,6 +83,35 @@ Without this, the bot will only receive messages that directly mention it (e.g.,
 ### Auto recap
 - Background worker finds chats due for auto recap on a fixed 6-hour cadence, generates recap, sends it to the originating group, then updates `last_recap_at`.
 
+### Health & lifecycle
+
+Startup order mirrors Go: the `/health` listener binds first (`HEALTH_HTTP_PORT`,
+default `7069`, must be `1..=65535`), then a one-second pause, then the
+Telegram dispatcher starts, then the automatic-recap poller is armed.
+
+`/health` returns Go's composite readiness JSON instead of a bare `SELECT 1`:
+
+```json
+{
+  "status": "up",
+  "details": {
+    "telegram_bot": { "status": "up" },
+    "auto recap timecapsule digger": { "status": "up" },
+    "auto_recap": { "status": "up" }
+  }
+}
+```
+
+Each named check flips from `down` to `up` exactly once (Telegram bot
+authorized, the automatic-recap poller started, the automatic-recap
+subsystem started) and never reverts; the aggregate `status` is `up` (HTTP
+200) only once all three are up, and `down` (HTTP 503) otherwise.
+
+On SIGINT (all platforms) or SIGTERM (Unix), the process shuts down in Go's
+reverse startup order: the Telegram dispatcher stops, the database pool
+closes, the `/health` HTTP server shuts down gracefully with a ten-second
+timeout, then the automatic-recap poller stops.
+
 ### Migration from the Go bot
 
 The Rust service does not run directly on the legacy Go PostgreSQL schema. Migration from the Go bot is a one-time transform into the Rust-owned schema.

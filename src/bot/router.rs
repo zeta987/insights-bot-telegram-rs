@@ -94,8 +94,11 @@ pub fn build_dispatcher(
         .branch(callback_handler)
         .branch(my_chat_member_handler);
 
+    // Signal handling and reverse-order shutdown are driven explicitly by
+    // `main.rs` via `Dispatcher::shutdown_token`, so teloxide's own built-in
+    // Ctrl+C handler is left disabled to avoid a second, uncoordinated
+    // shutdown path.
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![ctx.clone()])
-        .enable_ctrlc_handler()
         .build()
 }

@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use teloxide::{prelude::*, types::ChatFullInfo};
+use tokio::sync::watch;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -322,6 +323,10 @@ pub async fn spawn_autorecap(ctx: Arc<AppContext>) {
         return;
     };
 
+    // Matches Go's `autorecap.Run()`, which flips `AutoRecapService.started`
+    // once the subsystem is armed, ahead of the digger's own start flag.
+    ctx.lifecycle.mark_auto_recap_started();
+
     queue_all_enabled_chats(&ctx, state.as_ref()).await;
 
     if ctx.config.auto_recap_test.enabled && ctx.config.auto_recap_test.chat_id != 0 {
@@ -340,30 +345,60 @@ pub async fn spawn_autorecap(ctx: Arc<AppContext>) {
         });
     }
 
+    let shutdown = ctx.shutdown_rx.clone();
+    let loop_ctx = ctx.clone();
     tokio::spawn(async move {
-        let first_tick = Instant::now() + AUTO_RECAP_POLL_INTERVAL;
-        let mut ticker = interval_at(first_tick, AUTO_RECAP_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            let now_ms = Utc::now().timestamp_millis();
-            match pop_due_auto_recap(state.as_ref(), now_ms).await {
-                Ok(Some(capsule)) => {
-                    if let Err(source) =
-                        handle_auto_recap_capsule(ctx.clone(), state.clone(), capsule.chat_id).await
-                    {
-                        error!(
-                            chat_id = capsule.chat_id,
-                            error = %source,
-                            "automatic recap capsule failed"
-                        );
+        run_autorecap_poll_loop(loop_ctx, state, shutdown).await;
+    });
+    // Matches Go's digger `OnStart` hook, which flips `started` right after
+    // the polling goroutine is kicked off, not after it first ticks.
+    ctx.lifecycle.mark_poller_started();
+}
+
+/// Poll the automatic-recap queue on Go's one-second cadence until told to
+/// stop. This is the Rust equivalent of Go's `AutoRecapTimeCapsuleDigger`
+/// polling goroutine (`internal/datastore/timecapsule.go`).
+///
+/// Exposed as a crate-visible, awaitable test seam (matching the existing
+/// `AutoRecapStartupSeeder`/`AutoRecapStateReader` precedent) so integration
+/// tests can drive shutdown deterministically with a paused clock instead of
+/// sleeping or polling for the spawned task to notice a signal.
+pub async fn run_autorecap_poll_loop(
+    ctx: Arc<AppContext>,
+    state: Arc<dyn RecapStateStore>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    let first_tick = Instant::now() + AUTO_RECAP_POLL_INTERVAL;
+    let mut ticker = interval_at(first_tick, AUTO_RECAP_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let now_ms = Utc::now().timestamp_millis();
+                match pop_due_auto_recap(state.as_ref(), now_ms).await {
+                    Ok(Some(capsule)) => {
+                        if let Err(source) =
+                            handle_auto_recap_capsule(ctx.clone(), state.clone(), capsule.chat_id).await
+                        {
+                            error!(
+                                chat_id = capsule.chat_id,
+                                error = %source,
+                                "automatic recap capsule failed"
+                            );
+                        }
                     }
+                    Ok(None) => {}
+                    Err(source) => error!(error = %source, "automatic recap queue poll failed"),
                 }
-                Ok(None) => {}
-                Err(source) => error!(error = %source, "automatic recap queue poll failed"),
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    info!("automatic recap poller stopping on shutdown signal");
+                    break;
+                }
             }
         }
-    });
+    }
 }
 
 async fn queue_all_enabled_chats(ctx: &AppContext, state: &dyn RecapStateStore) {

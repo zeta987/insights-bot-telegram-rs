@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use insights_bot_telegram_rs::{
@@ -73,16 +74,52 @@ async fn run() -> Result<()> {
         ctx.config.locale.code()
     );
 
-    // Start background services.
+    // Startup order mirrors Go (`docs/adr/0001-go-parity-adjudication.md`,
+    // decision 6): bind the health listener, hold Go's one-second pause,
+    // start the Telegram dispatcher, then arm the automatic-recap poller.
+    let health_addr = format!("0.0.0.0:{}", ctx.config.health_http_port)
+        .parse()
+        .context("invalid health listener address")?;
+    let health = http::health::serve(ctx.lifecycle.clone(), health_addr).await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let bot_handle = bot::run(ctx.clone()).await?;
+
     services::autorecap::spawn_autorecap(ctx.clone()).await;
 
-    // Health endpoint (optional port 3000).
-    let health_addr = "0.0.0.0:3000".parse().unwrap();
-    http::health::serve(database, health_addr);
+    wait_for_shutdown_signal().await;
+    info!("shutdown signal received; stopping in Go's reverse startup order");
 
-    // Start bot dispatcher.
-    bot::run(ctx).await?;
+    // Reverse order (decision 8): dispatcher, database pool, HTTP server
+    // (ten-second timeout), poller.
+    bot_handle.shutdown().await;
+    database.pool.close().await;
+    health.shutdown().await;
+    let _ = ctx.shutdown_tx.send(true);
+
     Ok(())
+}
+
+/// Wait for SIGINT (all platforms) or SIGTERM (Unix only), matching Go's
+/// `fx` app, which listens for both to begin graceful shutdown.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
+            _ = sigterm.recv() => info!("received SIGTERM"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("received Ctrl+C");
+    }
 }
 
 /// Build the one production message preprocessor the middleware runs.

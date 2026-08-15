@@ -5,6 +5,8 @@ use teloxide::Bot;
 use url::Url;
 
 const OFFICIAL_TELEGRAM_API_ENDPOINT: &str = "https://api.telegram.org";
+/// Go's health server binds `:7069` (`internal/services/health/health.go`).
+const DEFAULT_HEALTH_HTTP_PORT: u16 = 7069;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Locale {
@@ -138,6 +140,9 @@ pub struct AppConfig {
     pub log_level: String,
     pub log_file_path: Option<String>,
     pub locales_dir: String,
+    /// Port for the composite `/health` readiness listener. Defaults to Go's
+    /// `7069` (`internal/services/health/health.go`).
+    pub health_http_port: u16,
 }
 
 impl AppConfig {
@@ -285,6 +290,7 @@ impl AppConfig {
             log_file_path: optional_non_empty(&lookup, "LOG_FILE_PATH"),
             locales_dir: optional_non_empty(&lookup, "LOCALES_DIR")
                 .unwrap_or_else(|| "./locales".to_owned()),
+            health_http_port: health_http_port(optional_non_empty(&lookup, "HEALTH_HTTP_PORT"))?,
         })
     }
 }
@@ -329,6 +335,23 @@ fn redis_port(value: Option<String>) -> Result<u16> {
         .with_context(|| "REDIS_PORT must be in 1..=65535")?;
     if port == 0 {
         bail!("REDIS_PORT must be in 1..=65535");
+    }
+    Ok(port)
+}
+
+/// Parse `HEALTH_HTTP_PORT`, defaulting to Go's `7069` when absent, and
+/// failing fast on a malformed or out-of-range value (same posture as
+/// `redis_port`, so an operator typo is caught at startup rather than at
+/// bind time).
+fn health_http_port(value: Option<String>) -> Result<u16> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_HEALTH_HTTP_PORT);
+    };
+    let port = value
+        .parse::<u16>()
+        .with_context(|| "HEALTH_HTTP_PORT must be in 1..=65535")?;
+    if port == 0 {
+        bail!("HEALTH_HTTP_PORT must be in 1..=65535");
     }
     Ok(port)
 }

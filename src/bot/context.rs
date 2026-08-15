@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
+use tokio::sync::watch;
+
 use crate::{
     config::AppConfig,
     db::Database,
     i18n::I18n,
+    lifecycle::LifecycleFlags,
     redis::recap_state::RecapStateStore,
     services::{
         message_capture::DynMessagePreprocessor, openai::OpenAiClient,
@@ -28,6 +31,14 @@ pub struct AppContext {
     /// one; `None` exists for legacy and unit-test construction, and makes the
     /// message middleware skip persistence rather than guess at a substitute.
     pub message_preprocessor: Option<Arc<DynMessagePreprocessor>>,
+    /// Composite `/health` readiness flags; see [`LifecycleFlags`].
+    pub lifecycle: Arc<LifecycleFlags>,
+    /// Trigger side of the process-wide shutdown signal. Sending `true`
+    /// tells cancellable background loops (the automatic-recap poller) to
+    /// stop, mirroring Go's reverse-order `fx.Hook` teardown.
+    pub shutdown_tx: watch::Sender<bool>,
+    /// Receive side of the shutdown signal, cloned by each cancellable loop.
+    pub shutdown_rx: watch::Receiver<bool>,
 }
 
 #[derive(Clone)]
@@ -61,6 +72,7 @@ impl AppContext {
         telegraph: Option<TelegraphService>,
         recap_runtime: RecapRuntimeDependencies,
     ) -> Arc<Self> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Arc::new(Self {
             config,
             db,
@@ -71,6 +83,9 @@ impl AppContext {
             recap_state: recap_runtime.recap_state,
             raw_telegram_http: recap_runtime.raw_telegram_http,
             message_preprocessor: recap_runtime.message_preprocessor,
+            lifecycle: LifecycleFlags::new(),
+            shutdown_tx,
+            shutdown_rx,
         })
     }
 }

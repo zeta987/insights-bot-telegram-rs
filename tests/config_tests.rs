@@ -71,6 +71,7 @@ fn config_parses_every_recap_variable_with_exact_casing() {
         ("TIMEZONE_SHIFT_SECONDS", "28800"),
         ("AUTO_RECAP_TEST_ENABLED", "1"),
         ("AUTO_RECAP_TEST_CHAT_ID", "-100123"),
+        ("HEALTH_HTTP_PORT", "8099"),
     ]);
 
     let cfg = config(&values).expect("configuration should load");
@@ -107,6 +108,7 @@ fn config_parses_every_recap_variable_with_exact_casing() {
     assert_eq!(cfg.timezone_shift_seconds, 28800);
     assert!(cfg.auto_recap_test.enabled);
     assert_eq!(cfg.auto_recap_test.chat_id, -100123);
+    assert_eq!(cfg.health_http_port, 8099);
 }
 
 #[test]
@@ -124,6 +126,7 @@ fn config_uses_canonical_secret_and_go_defaults() {
     assert_eq!(cfg.recap_openai.token_limit, 4096);
     assert_eq!(cfg.recap_openai.recap_reserve, 2000);
     assert_eq!(cfg.recap_openai.summary_language, "Simplified Chinese");
+    assert_eq!(cfg.health_http_port, 7069, "Go's health server binds :7069");
 }
 
 #[test]
@@ -215,6 +218,31 @@ fn config_rejects_invalid_redis_ports() {
     .err()
     .expect("a missing Redis port must be rejected");
     assert!(err.to_string().contains("REDIS_PORT"));
+}
+
+#[test]
+fn config_rejects_invalid_health_http_ports_but_defaults_when_absent() {
+    for raw in ["0", "broken", "65536"] {
+        let mut values = required_values();
+        values.push(("HEALTH_HTTP_PORT", raw));
+        let err = config(&values)
+            .err()
+            .expect("invalid HEALTH_HTTP_PORT must be rejected");
+        assert!(
+            err.to_string().contains("HEALTH_HTTP_PORT"),
+            "HEALTH_HTTP_PORT={raw}"
+        );
+    }
+
+    // Empty and absent both fall back to Go's default port.
+    for values in [required_values(), {
+        let mut values = required_values();
+        values.push(("HEALTH_HTTP_PORT", ""));
+        values
+    }] {
+        let cfg = config(&values).expect("HEALTH_HTTP_PORT is optional");
+        assert_eq!(cfg.health_http_port, 7069);
+    }
 }
 
 #[test]

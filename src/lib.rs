@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod http;
 pub mod i18n;
+pub mod lifecycle;
 pub mod redis;
 pub mod services;
 pub mod telemetry;

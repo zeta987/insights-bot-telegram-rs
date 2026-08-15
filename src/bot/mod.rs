@@ -8,21 +8,61 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
+use teloxide::dispatching::ShutdownToken;
 use teloxide::prelude::*;
 use teloxide::types::BotCommand;
 use teloxide::update_listeners::webhooks;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use context::AppContext;
 
-pub async fn run(ctx: Arc<AppContext>) -> Result<()> {
+/// A running dispatcher, returned once the Telegram bot has been authorized
+/// and its update loop has been armed (spawned, not blocked on).
+pub struct BotHandle {
+    shutdown_token: ShutdownToken,
+    join_handle: JoinHandle<()>,
+}
+
+impl BotHandle {
+    /// Stop the dispatcher and wait for it to finish, mirroring Go's
+    /// `bot.Stop(ctx)` (`pkg/bots/tgbot/tgbot.go`).
+    pub async fn shutdown(self) {
+        if let Ok(wait) = self.shutdown_token.shutdown() {
+            wait.await;
+        }
+        let _ = self.join_handle.await;
+    }
+}
+
+/// Authorize the bot, register its command menu, then arm the dispatcher.
+///
+/// Returns as soon as the dispatcher's update loop has been spawned rather
+/// than blocking for the process lifetime, so callers can continue startup
+/// (arming the automatic-recap poller) and later drive an orderly shutdown
+/// through the returned [`BotHandle`].
+pub async fn run(ctx: Arc<AppContext>) -> Result<BotHandle> {
     let bot = ctx.config.telegram.bot();
-    let webhook_url = ctx.config.telegram.webhook_url.clone();
+
+    // Go's `tgbotapi.NewBotAPI` resolves `bot.Self` via a synchronous GetMe
+    // call during bot construction, and `telegram.NewBot` logs "Authorized as
+    // bot @%s" immediately after (`internal/bots/telegram/telegram.go:64-75`).
+    // Mirror that authorization step explicitly and flip the composite
+    // `/health` readiness flag on success; a failure here fails startup, same
+    // as Go's constructor-time error.
+    let me = bot
+        .get_me()
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to authorize telegram bot: {e}"))?;
+    ctx.lifecycle.mark_bot_authorized();
+    info!("authorized as bot @{}", me.username());
 
     // Register bot commands with Telegram for menu display.
     if let Err(e) = register_commands(&bot).await {
         warn!(error = %e, "failed to register bot commands");
     }
+
+    let webhook_url = ctx.config.telegram.webhook_url.clone();
 
     // Decide: webhook mode or long-polling mode.
     if let Some(url) = webhook_url {
@@ -60,14 +100,20 @@ async fn register_commands(bot: &Bot) -> Result<()> {
     Ok(())
 }
 
-async fn run_polling(bot: Bot, ctx: Arc<AppContext>) -> Result<()> {
+async fn run_polling(bot: Bot, ctx: Arc<AppContext>) -> Result<BotHandle> {
     info!("starting telegram dispatcher (long-polling mode)");
     let mut dispatcher = router::build_dispatcher(bot, ctx);
-    dispatcher.dispatch().await;
-    Ok(())
+    let shutdown_token = dispatcher.shutdown_token();
+    let join_handle = tokio::spawn(async move {
+        dispatcher.dispatch().await;
+    });
+    Ok(BotHandle {
+        shutdown_token,
+        join_handle,
+    })
 }
 
-async fn run_webhook(bot: Bot, ctx: Arc<AppContext>, webhook_url: &str) -> Result<()> {
+async fn run_webhook(bot: Bot, ctx: Arc<AppContext>, webhook_url: &str) -> Result<BotHandle> {
     let port = ctx.config.telegram.webhook_port.unwrap_or(8443);
     let addr: SocketAddr = ([0, 0, 0, 0], port).into();
 
@@ -87,9 +133,15 @@ async fn run_webhook(bot: Bot, ctx: Arc<AppContext>, webhook_url: &str) -> Resul
         .map_err(|e| anyhow::anyhow!("failed to setup webhook: {}", e))?;
 
     let mut dispatcher = router::build_dispatcher(bot, ctx);
-    dispatcher
-        .dispatch_with_listener(listener, LoggingErrorHandler::new())
-        .await;
+    let shutdown_token = dispatcher.shutdown_token();
+    let join_handle = tokio::spawn(async move {
+        dispatcher
+            .dispatch_with_listener(listener, LoggingErrorHandler::new())
+            .await;
+    });
 
-    Ok(())
+    Ok(BotHandle {
+        shutdown_token,
+        join_handle,
+    })
 }
