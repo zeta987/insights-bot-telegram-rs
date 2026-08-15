@@ -222,52 +222,17 @@ Latest verification before this handoff:
 - Automatic-recap focused tests passed: worker 11, queue 11, delivery 8,
   runtime 1.
 
-## Deferred parity decisions
+## Parity decisions
 
-Two parity questions surfaced by the configuration-error checkpoint are
-deliberately deferred; get an explicit decision before acting on either:
-
-- Go `processExceptionError` never reads `replyMarkup` and its edit is a bare
-  `NewEditMessageText` without parse mode or keyboard, so every
-  `ExceptionError` edit in Go drops the keyboard from the wire payload
-  (`pkg/bots/tgbot/handler.go:117-156`, `response.go`). Rust's
-  `edit_configuration` re-attaches the existing keyboard, and the committed
-  expired-callback checkpoint asserts that retention. Do not switch those
-  edits to bare payloads without approval.
-- Go treats a failed `QueueOneSendChatHistoriesRecapTaskForChatID` as the
-  toggle-enable or rate stage error, but Rust's `queue_next_auto_recap`
-  swallows queue errors after logging, so those two Go branches are currently
-  unreachable. Surfacing them changes a shared signature used by the worker
-  and the startup seed.
-
-The parity audit added these further deferred items; none is an in-scope
-Telegram callsite, so none was acted on without a decision:
-
-- `set_my_commands` runs on every Rust startup (`src/bot/mod.rs:36-61`); Go
-  v1.0.0 never calls `setMyCommands`. Removing it is a visible UX change.
-- A Telegraph client is still constructed and held on `AppContext`
-  (`src/services/telegraph.rs`, `src/main.rs`) although Go v1.0.0 removed the
-  Telegraph integration. Cleanup candidate.
-- Startup order is inverted versus Go (Rust arms the auto-recap poller, then
-  spawns health without waiting for the bind, then starts the dispatcher; Go
-  binds health, starts the dispatcher, then starts the digger) and the health
-  port differs: Go hardcodes `7069`, Rust `3000`, with no env override.
-- Go's `/health` is a composite checker (`telegram_bot`, digger, auto-recap
-  readiness as JSON); Rust's is a bare `SELECT 1`.
-- Rust has no SIGINT/SIGTERM graceful shutdown; Go stops every component in
-  reverse order via fx lifecycle hooks.
-- `REDIS_CLIENT_CACHE_ENABLED` is parsed but unwired; the `redis` crate has
-  no client-side-cache seam, so this likely becomes a documented deviation.
-- `services/rate_limit.rs::CommandRateLimiter` is dead scaffolding: built in
-  `main.rs`, stored on `AppContext`, never checked by the router.
-- Kept Rust hardenings, recorded as intentional: fail-fast
-  `TELEGRAM_BOT_API_ENDPOINT` validation, the missing-`error_code` HTTP-status
-  fallback in the Rich transport, and fail-fast `REDIS_PORT` parsing.
-- `handle_auto_recap_capsule` and `generate_and_deliver_auto_recap`
-  (`src/services/autorecap.rs`) are module-private and dispatch through
-  detached `tokio::spawn` calls with no completion signal, so they cannot be
-  covered without a src-side seam (`pub(crate)` or an awaitable variant); the
-  repository rejects sleep/poll synchronization in tests.
+Every previously deferred question was adjudicated on 2026-08-16 and is
+recorded in `docs/adr/0001-go-parity-adjudication.md`; the deviations that
+survive the ruling live in `docs/parity/go-parity-deviations.md`, the single
+registry to consult first for any future parity question. The ruled changes
+— bare `ExceptionError` edits, surfaced queue failures, the Telegraph and
+`CommandRateLimiter` removals, the Go startup order plus the health-port
+variable, the composite `/health`, graceful shutdown, and the autorecap test
+seam — are implemented as ordinary slices; pushing stays gated on the owner's
+explicit approval.
 
 ## Next required slice
 
