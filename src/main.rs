@@ -47,6 +47,9 @@ async fn run() -> Result<()> {
         info!("Telegraph service initialized");
     }
     let recap_state = connect_recap_state(&config.redis).await?;
+    // Built before `openai` is moved into the context, so the summarizer and
+    // the handlers share one configured client.
+    let message_preprocessor = build_message_preprocessor(&openai)?;
     let ctx = bot::context::AppContext::new(
         config,
         database.clone(),
@@ -56,6 +59,7 @@ async fn run() -> Result<()> {
         telegraph,
         bot::context::RecapRuntimeDependencies {
             recap_state: Some(recap_state),
+            message_preprocessor: Some(message_preprocessor),
             ..Default::default()
         },
     );
@@ -76,6 +80,27 @@ async fn run() -> Result<()> {
     // Start bot dispatcher.
     bot::run(ctx).await?;
     Ok(())
+}
+
+/// Build the one production message preprocessor the middleware runs.
+///
+/// The previewer is Go's `linkprev.Client` over Go's `req.C()` defaults, and
+/// the summarizer is the configured OpenAI client, shared rather than rebuilt
+/// so both halves of the process talk to the same endpoint.
+fn build_message_preprocessor(
+    openai: &services::openai::OpenAiClient,
+) -> Result<Arc<services::message_capture::DynMessagePreprocessor>> {
+    let previewer: Arc<dyn services::message_capture::LinkPreviewer> =
+        Arc::new(services::link_preview::HttpLinkPreviewer::new(
+            services::link_preview::go_parity_http_client()?,
+        ));
+    let summarizer: Arc<dyn services::message_capture::Summarizer> = Arc::new(
+        services::message_capture::OpenAiSummarizer::new(Arc::new(openai.clone())),
+    );
+
+    Ok(Arc::new(
+        services::message_capture::MessagePreprocessor::new(previewer, summarizer),
+    ))
 }
 
 /// Connect the recap state store described by the Redis configuration.

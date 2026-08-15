@@ -36,6 +36,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::future::join_all;
+use serde::Serialize;
 use tracing::warn;
 
 use crate::db::models::NewTelegramChatHistory;
@@ -114,6 +115,10 @@ pub struct CapturedMessage {
     pub caption_entities: Vec<CapturedEntity>,
     pub forward_from: Option<CapturedUser>,
     pub forward_from_chat: Option<CapturedChat>,
+    /// Go's `message.ForwardSenderName`, which is `""` when the forward header
+    /// carries no hidden sender. Only the private forwarded-replay payload
+    /// reads it; `SaveOneTelegramChatHistory` never does.
+    pub forward_sender_name: String,
     pub reply_to_message: Option<Box<CapturedMessage>>,
 }
 
@@ -123,6 +128,76 @@ pub struct EditedMessageCapture {
     pub chat_id: i64,
     pub message_id: i64,
     pub text: String,
+}
+
+/// Go's `telegramPrivateForwardedReplayChatHistory`.
+///
+/// Field order and the JSON names are Go's struct tags, and the serialization
+/// is compact, because Go's `json.Marshal` emits no whitespace. The Redis
+/// member is that exact byte string, so any drift here changes what a replay
+/// session reads back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrivateForwardedReplayChatHistory {
+    pub chat_id: i64,
+    pub chat_type: String,
+    pub chat_title: String,
+    pub message_id: i64,
+    pub actor_id: i64,
+    pub actor_username: String,
+    pub actor_display_name: String,
+    pub text: String,
+    pub chatted_at: i64,
+}
+
+/// Go's `SaveOneTelegramPrivateForwardedReplayChatHistory`, from the extracted
+/// text down to the value it hands `ZADD`.
+///
+/// The base actor is the *sender of the private message*, not the original
+/// author: `chat_title` and `actor_display_name` both start as that sender's
+/// full name, `actor_username` as that sender's username, and `actor_id` keeps
+/// Go's zero value. A forward header then overrides the actor, and a
+/// forward-from-chat header prefixes the text.
+pub fn private_forwarded_replay_entry(
+    message: &CapturedMessage,
+    text: &str,
+) -> PrivateForwardedReplayChatHistory {
+    let chat_actor_full_name =
+        full_name_from_first_and_last_name(&message.from.first_name, &message.from.last_name);
+
+    let mut entry = PrivateForwardedReplayChatHistory {
+        chat_id: message.chat.id,
+        chat_type: message.chat.kind.clone(),
+        chat_title: chat_actor_full_name.clone(),
+        message_id: message.message_id,
+        // Go leaves `ActorID` at its zero value on this base construction.
+        actor_id: 0,
+        actor_username: message.from.username.clone(),
+        actor_display_name: chat_actor_full_name,
+        // Go assigns `Text` last, after the forward-from-chat branch.
+        text: String::new(),
+        chatted_at: telegram_date_to_unix_millis(message.date),
+    };
+
+    if let Some(forward_from) = &message.forward_from {
+        entry.actor_id = forward_from.id;
+        entry.actor_username = forward_from.username.clone();
+        entry.actor_display_name =
+            full_name_from_first_and_last_name(&forward_from.first_name, &forward_from.last_name);
+    }
+    if message.forward_from.is_none() && !message.forward_sender_name.is_empty() {
+        entry.actor_id = 0;
+        entry.actor_username = message.forward_sender_name.clone();
+        entry.actor_display_name = message.forward_sender_name.clone();
+    }
+
+    entry.text = match &message.forward_from_chat {
+        Some(forward_from_chat) => {
+            format!("[forwarded from {}]: {}", forward_from_chat.title, text)
+        }
+        None => text.to_owned(),
+    };
+
+    entry
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +281,15 @@ pub struct MessagePreprocessor<P, S> {
     previewer: P,
     summarizer: S,
 }
+
+/// The one preprocessor shape the runtime stores.
+///
+/// Both seams are erased so production can install the HTTP previewer and the
+/// OpenAI summarizer while a test installs offline doubles, without the
+/// [`AppContext`](crate::bot::context::AppContext) becoming generic. The
+/// blanket `impl`s above make `Arc<dyn _>` satisfy the seam traits.
+pub type DynMessagePreprocessor =
+    MessagePreprocessor<std::sync::Arc<dyn LinkPreviewer>, std::sync::Arc<dyn Summarizer>>;
 
 impl<P, S> MessagePreprocessor<P, S>
 where
@@ -824,7 +908,7 @@ pub fn captured_entity_from_teloxide(entity: &teloxide::types::MessageEntity) ->
 /// See [`captured_entity_from_teloxide`] for the one representation difference
 /// against Go: the `text_link` href arrives here normalised.
 pub fn captured_message_from_teloxide(message: &teloxide::types::Message) -> CapturedMessage {
-    use teloxide::types::MessageEntity;
+    use teloxide::types::{MessageEntity, MessageOrigin};
 
     fn chat_kind(chat: &teloxide::types::Chat) -> String {
         if chat.is_private() {
@@ -864,6 +948,20 @@ pub fn captured_message_from_teloxide(message: &teloxide::types::Message) -> Cap
             .collect()
     }
 
+    /// Go's `message.ForwardFromChat`, which Telegram fills for a forward from
+    /// a channel as well as for one from a group posting as itself.
+    ///
+    /// teloxide's own `Message::forward_from_chat` matches only
+    /// `MessageOrigin::Chat`, so a channel forward would silently lose its
+    /// `[forwarded from ..]` prefix if that accessor were used here.
+    fn forward_from_chat(message: &teloxide::types::Message) -> Option<&teloxide::types::Chat> {
+        match message.forward_origin()? {
+            MessageOrigin::Chat { sender_chat, .. } => Some(sender_chat),
+            MessageOrigin::Channel { chat, .. } => Some(chat),
+            _ => None,
+        }
+    }
+
     CapturedMessage {
         message_id: message.id.0 as i64,
         date: message.date.timestamp(),
@@ -874,7 +972,11 @@ pub fn captured_message_from_teloxide(message: &teloxide::types::Message) -> Cap
         entities: captured_entities(message.entities()),
         caption_entities: captured_entities(message.caption_entities()),
         forward_from: message.forward_from_user().map(captured_user),
-        forward_from_chat: message.forward_from_chat().map(captured_chat),
+        forward_from_chat: forward_from_chat(message).map(captured_chat),
+        forward_sender_name: message
+            .forward_from_sender_name()
+            .unwrap_or_default()
+            .to_owned(),
         reply_to_message: message
             .reply_to_message()
             .map(|reply| Box::new(captured_message_from_teloxide(reply))),

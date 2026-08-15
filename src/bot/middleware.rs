@@ -1,135 +1,208 @@
+//! Go v1.0.0 message middleware, ported from
+//! `internal/bots/telegram/middlewares/record_messsages.go` and
+//! `internal/bots/telegram/middlewares/sync_with_edit_messages.go`.
+//!
+//! Go runs every middleware synchronously with a no-op `next`, then dispatches
+//! the update independently after the middleware loop. The router therefore
+//! awaits these taps before its migration and command branches. An early
+//! return, disabled chat, or storage failure skips only persistence and never
+//! suppresses the later Telegram dispatch.
+//!
+//! # Logging
+//!
+//! Go logs `err.Error()` and a debug line carrying the chat identifier and the
+//! message text. Every line below is a fixed string instead: no chat or user
+//! identifier, no name, no message text, no URL, no serialized payload, and no
+//! formatted error reaches the log.
+
 use std::sync::Arc;
 
-use teloxide::types::Message;
-use tracing::{debug, warn};
+use tracing::warn;
 
-use crate::{bot::context::AppContext, db::chat_history, db::models::MessageKind};
+use crate::{
+    bot::context::AppContext,
+    db::{Database, chat_history, feature_flags},
+    redis::recap_state::RecapStateStore,
+    services::message_capture::{
+        CapturedMessage, DynMessagePreprocessor, captured_message_from_teloxide,
+        private_forwarded_replay_entry,
+    },
+};
 
-/// Record a message to the database. Called from the router as a side effect.
-pub async fn record_message(ctx: Arc<AppContext>, msg: Message) {
-    let is_group_chat = msg.chat.is_group() || msg.chat.is_supergroup();
-    if !is_group_chat {
-        return;
-    }
+/// Telegram's wire spellings for the chat types Go's `RecordMessage` accepts.
+const CHAT_TYPE_GROUP: &str = "group";
+const CHAT_TYPE_SUPERGROUP: &str = "supergroup";
+const CHAT_TYPE_PRIVATE: &str = "private";
 
-    match chat_history::is_recap_enabled(&ctx.db.pool, msg.chat.id.0).await {
-        Ok(false) => return,
-        Ok(true) => {}
-        Err(err) => {
-            warn!("failed to determine recap enablement: {err:?}");
-            return;
-        }
-    }
+/// Go's `RecordMessage`, entered from the router with the typed update.
+pub async fn record_message(ctx: Arc<AppContext>, msg: teloxide::types::Message) {
+    let sender_user_id = msg.from.as_ref().map(|user| user.id.0 as i64);
+    let captured = captured_message_from_teloxide(&msg);
 
-    let text = msg
-        .text()
-        .map(|s| s.to_string())
-        .or_else(|| msg.caption().map(|s| s.to_string()));
-
-    let kind = if text.is_some() {
-        MessageKind::Text
-    } else if msg.photo().is_some() {
-        MessageKind::Photo
-    } else if msg.video().is_some() {
-        MessageKind::Video
-    } else if msg.audio().is_some() {
-        MessageKind::Audio
-    } else if msg.voice().is_some() {
-        MessageKind::Voice
-    } else if msg.document().is_some() {
-        MessageKind::Document
-    } else if msg.sticker().is_some() {
-        MessageKind::Sticker
-    } else {
-        MessageKind::Other
-    };
-
-    let created_at = msg.date.timestamp();
-    let chat_id = msg.chat.id.0;
-    let from_id = msg.from.as_ref().map(|u| u.id.0 as i64);
-    // Extract full name (first_name + last_name)
-    let from_full_name = msg.from.as_ref().map(|u| {
-        let mut name = u.first_name.clone();
-        if let Some(ref last) = u.last_name {
-            name.push(' ');
-            name.push_str(last);
-        }
-        name
-    });
-    let from_username = msg.from.as_ref().and_then(|u| u.username.clone());
-
-    let preview = text.clone().unwrap_or_else(|| "<non-text>".to_string());
-    let from = msg
-        .from
-        .as_ref()
-        .map(|u| u.username.clone().unwrap_or_else(|| u.first_name.clone()))
-        .unwrap_or_else(|| "<unknown>".to_string());
-
-    debug!(
-        chat_id = chat_id,
-        message_id = msg.id.0,
-        kind = ?kind,
-        from = %from,
-        preview = %preview,
-        "recording message"
-    );
-
-    // Record to chat_histories
-    if let Err(err) = chat_history::insert_message(
-        &ctx.db.pool,
-        chat_id,
-        msg.id.0 as i64,
-        from_id,
-        from_full_name,
-        from_username,
-        kind,
-        text.clone(),
-        None,
-        created_at,
+    record_captured_message(
+        &ctx.db,
+        ctx.recap_state.as_ref(),
+        ctx.message_preprocessor.as_deref(),
+        &captured,
+        sender_user_id,
     )
-    .await
-    {
-        warn!("record_message failed: {err:?}");
+    .await;
+}
+
+/// Go's `SyncWithEditedMessage`, entered from the router with the typed update.
+pub async fn record_edited_message(ctx: Arc<AppContext>, msg: teloxide::types::Message) {
+    let captured = captured_message_from_teloxide(&msg);
+
+    record_captured_edited_message(&ctx.db, ctx.message_preprocessor.as_deref(), &captured).await;
+}
+
+/// The transport-free half of Go's `RecordMessage`.
+///
+/// `sender_user_id` is `None` when Telegram sent no `from`, which is Go's
+/// `message.From == nil`. Go dereferences it unconditionally on the private
+/// path; a nil `from` is skipped here rather than panicking the process.
+pub async fn record_captured_message(
+    db: &Database,
+    recap_state: Option<&Arc<dyn RecapStateStore>>,
+    preprocessor: Option<&DynMessagePreprocessor>,
+    message: &CapturedMessage,
+    sender_user_id: Option<i64>,
+) {
+    match message.chat.kind.as_str() {
+        CHAT_TYPE_GROUP | CHAT_TYPE_SUPERGROUP => {
+            record_group_message(db, preprocessor, message).await;
+        }
+        CHAT_TYPE_PRIVATE => {
+            record_private_message(recap_state, preprocessor, message, sender_user_id).await;
+        }
+        // Go's `lo.Contains` gate drops every other chat type, channels
+        // included, before it reads the feature flag.
+        _ => {}
     }
 }
 
-/// Update an edited message in the database. Called from the router as a side effect.
-pub async fn record_edited_message(ctx: Arc<AppContext>, msg: Message) {
-    let is_group_chat = msg.chat.is_group() || msg.chat.is_supergroup();
-    if !is_group_chat {
-        return;
-    }
-
-    match chat_history::is_recap_enabled(&ctx.db.pool, msg.chat.id.0).await {
-        Ok(false) => return,
+/// Go's group branch: the feature flag, then `SaveOneTelegramChatHistory`.
+async fn record_group_message(
+    db: &Database,
+    preprocessor: Option<&DynMessagePreprocessor>,
+    message: &CapturedMessage,
+) {
+    match feature_flags::has_recap_enabled(db, message.chat.id, &message.chat.title).await {
         Ok(true) => {}
-        Err(err) => {
-            warn!("failed to determine recap enablement: {err:?}");
+        Ok(false) => return,
+        Err(_) => {
+            warn!("failed to read the chat histories recap feature flag");
             return;
         }
     }
 
-    let new_text = msg
-        .text()
-        .map(|s| s.to_string())
-        .or_else(|| msg.caption().map(|s| s.to_string()));
+    let Some(preprocessor) = preprocessor else {
+        warn!("message preprocessing is not configured; skipping chat history persistence");
+        return;
+    };
 
-    if let Some(text) = new_text {
-        debug!(
-            chat_id = msg.chat.id.0,
-            message_id = msg.id.0,
-            "updating edited message"
-        );
-
-        if let Err(err) = chat_history::update_message_text(
-            &ctx.db.pool,
-            msg.chat.id.0,
-            msg.id.0 as i64,
-            &text,
-        )
-        .await
-        {
-            warn!("record_edited_message failed: {err:?}");
+    let captured = match preprocessor.capture_message(message).await {
+        Ok(Some(captured)) => captured,
+        // Go returns early on an empty extraction without storing anything.
+        Ok(None) => return,
+        Err(_) => {
+            warn!("failed to preprocess a group message; skipping chat history persistence");
+            return;
         }
+    };
+
+    if chat_history::save_one(db, &captured).await.is_err() {
+        warn!("failed to persist a chat history row");
+    }
+}
+
+/// Go's private branch: `SaveOneTelegramPrivateForwardedReplayChatHistory`.
+async fn record_private_message(
+    recap_state: Option<&Arc<dyn RecapStateStore>>,
+    preprocessor: Option<&DynMessagePreprocessor>,
+    message: &CapturedMessage,
+    sender_user_id: Option<i64>,
+) {
+    let Some(sender_user_id) = sender_user_id else {
+        return;
+    };
+    let Some(recap_state) = recap_state else {
+        return;
+    };
+
+    match recap_state.forwarded_active(sender_user_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(_) => {
+            warn!("failed to read the forwarded replay session state");
+            return;
+        }
+    }
+
+    let Some(preprocessor) = preprocessor else {
+        warn!("message preprocessing is not configured; skipping forwarded replay capture");
+        return;
+    };
+
+    // Go calls the guarded `extractTextFromMessage` here, the same entry point
+    // the group path uses, so the both-empty guard applies.
+    let text = match preprocessor.extract_text_guarded(Some(message)).await {
+        Ok(text) => text,
+        Err(_) => {
+            warn!("failed to preprocess a private message; skipping forwarded replay capture");
+            return;
+        }
+    };
+    if text.is_empty() {
+        return;
+    }
+
+    let entry = private_forwarded_replay_entry(message, &text);
+    let Ok(json) = serde_json::to_string(&entry) else {
+        warn!("failed to serialize a forwarded replay entry");
+        return;
+    };
+
+    // `append_forwarded` already refreshes both session TTLs, which is Go's
+    // pair of `EXPIRE` calls after the `ZADD`.
+    if recap_state
+        .append_forwarded(sender_user_id, entry.chatted_at, &json)
+        .await
+        .is_err()
+    {
+        warn!("failed to append a forwarded replay entry");
+    }
+}
+
+/// The transport-free half of Go's `SyncWithEditedMessage`.
+///
+/// Go checks neither the chat type nor the feature flag on this path, so an
+/// edit in any chat rewrites whatever row already matches the pair. A chat that
+/// never persisted the message simply updates nothing.
+pub async fn record_captured_edited_message(
+    db: &Database,
+    preprocessor: Option<&DynMessagePreprocessor>,
+    message: &CapturedMessage,
+) {
+    let Some(preprocessor) = preprocessor else {
+        warn!("message preprocessing is not configured; skipping the edited message sync");
+        return;
+    };
+
+    let edited = match preprocessor.capture_edited_message(Some(message)).await {
+        Ok(Some(edited)) => edited,
+        // Go returns early when neither the text nor the caption survives.
+        Ok(None) => return,
+        Err(_) => {
+            warn!("failed to preprocess an edited message; skipping the edited message sync");
+            return;
+        }
+    };
+
+    if chat_history::update_one_text(db, edited.chat_id, edited.message_id, &edited.text)
+        .await
+        .is_err()
+    {
+        warn!("failed to rewrite an edited chat history row");
     }
 }

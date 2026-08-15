@@ -26,28 +26,23 @@ pub fn build_dispatcher(
     let migration_filter = dptree::filter(|msg: Message| msg.migrate_to_chat_id().is_some())
         .endpoint(MigrationHandlers::handle_chat_migration);
 
-    // Message handler: record ALL messages first, then try commands
+    // Message handler: record ALL messages first, then try commands.
+    //
+    // `inspect_async` is awaited in line, which is Go's synchronous middleware
+    // pass, and it never branches, so a disabled chat or a storage failure
+    // still reaches the migration and command branches below.
     let message_handler = Update::filter_message()
-        // Use inspect to record message as side effect (doesn't affect control flow)
-        .inspect(|ctx: Arc<AppContext>, msg: Message| {
-            let ctx = ctx.clone();
-            let msg = msg.clone();
-            tokio::spawn(async move {
-                middleware::record_message(ctx, msg).await;
-            });
+        .inspect_async(|ctx: Arc<AppContext>, msg: Message| async move {
+            middleware::record_message(ctx, msg).await;
         })
         // Catch migration events before command parsing
         .branch(migration_filter)
         // Then try to match commands
         .branch(commands);
 
-    let edited_message_handler = Update::filter_edited_message().inspect(
-        |ctx: Arc<AppContext>, msg: Message| {
-            let ctx = ctx.clone();
-            let msg = msg.clone();
-            tokio::spawn(async move {
-                middleware::record_edited_message(ctx, msg).await;
-            });
+    let edited_message_handler = Update::filter_edited_message().inspect_async(
+        |ctx: Arc<AppContext>, msg: Message| async move {
+            middleware::record_edited_message(ctx, msg).await;
         },
     );
 
