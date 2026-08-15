@@ -38,6 +38,7 @@ use wiremock::{
 const START_MS: i64 = 1_700_000_000_000;
 const CHAT_ID: i64 = -1_001_234_567_890;
 const FROM_ID: i64 = 42;
+const GROUP_ANONYMOUS_BOT_ID: i64 = 1_087_968_824;
 
 fn bot_me() -> Me {
     serde_json::from_value(serde_json::json!({
@@ -110,6 +111,25 @@ fn telegram_member_result(user_id: i64) -> Value {
     })
 }
 
+fn group_anonymous_bot_json() -> Value {
+    serde_json::json!({
+        "id": GROUP_ANONYMOUS_BOT_ID,
+        "is_bot": true,
+        "first_name": "Group",
+        "username": "GroupAnonymousBot"
+    })
+}
+
+fn telegram_group_anonymous_member_result() -> Value {
+    serde_json::json!({
+        "ok": true,
+        "result": {
+            "user": group_anonymous_bot_json(),
+            "status": "member"
+        }
+    })
+}
+
 fn telegram_owner_result() -> Value {
     serde_json::json!({
         "ok": true,
@@ -169,6 +189,19 @@ fn configure_callback(wire: &str) -> CallbackQuery {
         "data": wire
     }))
     .expect("valid configure callback")
+}
+
+fn anonymous_configure_command() -> Message {
+    let mut value = serde_json::to_value(configure_command()).expect("serialize command");
+    value["from"] = group_anonymous_bot_json();
+    serde_json::from_value(value).expect("anonymous configure command")
+}
+
+fn anonymous_configure_callback(wire: &str) -> CallbackQuery {
+    let mut value = serde_json::to_value(configure_callback(wire)).expect("serialize callback");
+    value["from"] = group_anonymous_bot_json();
+    value["message"]["reply_to_message"]["from"] = group_anonymous_bot_json();
+    serde_json::from_value(value).expect("anonymous configure callback")
 }
 
 fn request_body(request: &wiremock::Request) -> Value {
@@ -1075,4 +1108,112 @@ async fn administrators_receive_go_creator_only_error_for_mode_rate_and_pin() {
             "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，抱歉，此操作无法进行，只有<b>群组创建者</b>角色可以配置聊天记录回顾的模式。"
         );
     }
+}
+
+#[tokio::test]
+async fn group_anonymous_bot_is_looked_up_before_every_admin_exception() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(
+            serde_json::json!({"user_id": GROUP_ANONYMOUS_BOT_ID}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_group_anonymous_member_result()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/DeleteMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": true
+        })))
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state.clone()).await;
+
+    handle_configure_recap(
+        context.config.telegram.bot(),
+        anonymous_configure_command(),
+        bot_me(),
+        context.clone(),
+    )
+    .await
+    .expect("anonymous configure command");
+
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: GROUP_ANONYMOUS_BOT_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("anonymous enabled keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let toggle_off = keyboard["inline_keyboard"][1][1]["callback_data"]
+        .as_str()
+        .expect("toggle off wire");
+    let complete = keyboard["inline_keyboard"][8][0]["callback_data"]
+        .as_str()
+        .expect("complete wire");
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        anonymous_configure_callback(toggle_off),
+        bot_me(),
+        context.clone(),
+    )
+    .await
+    .expect("anonymous toggle callback");
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        anonymous_configure_callback(complete),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("anonymous complete callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.url.path().ends_with("/GetChatMember")
+                    && request_body(request)["user_id"] == GROUP_ANONYMOUS_BOT_ID
+            })
+            .count(),
+        3,
+        "Go queries membership before applying each GroupAnonymousBot exception"
+    );
 }

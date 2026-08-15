@@ -157,23 +157,18 @@ pub async fn handle_configure_recap(
     let Some(actor) = message.from.as_ref() else {
         return reply(&bot, &message, CONFIGURE_UNAVAILABLE, false, None).await;
     };
-    if !is_group_anonymous_bot(actor) {
-        let actor_is_admin = match bot.get_chat_member(message.chat.id, actor.id).await {
-            Ok(member) => matches!(
-                member.status(),
-                ChatMemberStatus::Owner | ChatMemberStatus::Administrator
-            ),
-            Err(error) => {
-                error!(
-                    ?error,
-                    "failed to check recap configuration actor permission"
-                );
-                return reply(&bot, &message, CONFIGURE_UNAVAILABLE, false, None).await;
-            }
-        };
-        if !actor_is_admin {
-            return reply(&bot, &message, ACTOR_ADMIN_REQUIRED, true, None).await;
+    let actor_is_admin = match check_admin_or_anonymous_permission(&bot, &message, actor).await {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            error!(
+                ?error,
+                "failed to check recap configuration actor permission"
+            );
+            return reply(&bot, &message, CONFIGURE_UNAVAILABLE, false, None).await;
         }
+    };
+    if !actor_is_admin {
+        return reply(&bot, &message, ACTOR_ADMIN_REQUIRED, true, None).await;
     }
 
     let chat_id = message.chat.id.0;
@@ -235,6 +230,18 @@ fn callback_origin_is_anonymous(callback: &CallbackQuery) -> bool {
         .and_then(Message::reply_to_message)
         .and_then(|message| message.from.as_ref())
         .is_some_and(is_group_anonymous_bot)
+}
+
+async fn check_admin_or_anonymous_permission(
+    bot: &Bot,
+    message: &Message,
+    actor: &User,
+) -> ResponseResult<bool> {
+    let membership = bot.get_chat_member(message.chat.id, actor.id).await?;
+    Ok(matches!(
+        membership.status(),
+        ChatMemberStatus::Owner | ChatMemberStatus::Administrator
+    ) || is_group_anonymous_bot(actor))
 }
 
 async fn check_creator_only_permission(
@@ -320,20 +327,14 @@ pub async fn handle_toggle_callback(
     if !bot_is_admin {
         return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
-    let actor_is_admin = if is_group_anonymous_bot(&callback.from) {
-        true
-    } else {
-        match bot.get_chat_member(message.chat.id, callback.from.id).await {
-            Ok(member) => matches!(
-                member.status(),
-                ChatMemberStatus::Owner | ChatMemberStatus::Administrator
-            ),
+    let actor_is_admin =
+        match check_admin_or_anonymous_permission(&bot, message, &callback.from).await {
+            Ok(allowed) => allowed,
             Err(error) => {
                 error!(?error, "failed to check recap toggle actor permission");
                 return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
             }
-        }
-    };
+        };
     if !actor_is_admin {
         return Ok(());
     }
@@ -779,20 +780,14 @@ pub async fn handle_complete_callback(
     {
         return Ok(());
     }
-    let actor_is_admin = if is_group_anonymous_bot(&callback.from) {
-        true
-    } else {
-        match bot.get_chat_member(message.chat.id, callback.from.id).await {
-            Ok(member) => matches!(
-                member.status(),
-                ChatMemberStatus::Owner | ChatMemberStatus::Administrator
-            ),
+    let actor_is_admin =
+        match check_admin_or_anonymous_permission(&bot, message, &callback.from).await {
+            Ok(allowed) => allowed,
             Err(error) => {
                 error!(?error, "failed to check recap complete actor permission");
                 return edit_configuration(&bot, &callback, CONFIGURE_UNAVAILABLE, None).await;
             }
-        }
-    };
+        };
     if !actor_is_admin {
         return Ok(());
     }

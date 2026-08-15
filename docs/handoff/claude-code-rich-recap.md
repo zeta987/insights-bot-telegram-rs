@@ -76,8 +76,11 @@ success-only audit originally missed:
   mode error for all three operations, including the duplicated
   `抱歉，此操作无法进行` text. Bot-admin denial edits now include the configuration
   header exactly as Go does.
-- Two RED-to-GREEN transport tests raise the focused configuration total to
-  nine.
+- Command, toggle, and complete now query GroupAnonymousBot membership before
+  applying the exception, so a Bot API error follows Go's error path instead of
+  continuing the mutation.
+- Three RED-to-GREEN transport tests raise the focused configuration total to
+  ten.
 
 The current automatic-recap checkpoint adds:
 
@@ -107,18 +110,19 @@ Latest verification before this handoff:
 
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
-- `/configure_recap` focused tests passed: 9.
+- `/configure_recap` focused tests passed: 10.
 - Automatic-recap focused tests passed: worker 9, queue 11, delivery 8.
 
 ## Next required slice
 
 Continue the read-only pinned-Go versus Rust audit of the completed automatic
 worker and configuration runtime; passing tests do not prove every error branch.
-The ordinary-member and creator-only callback branches are complete. Next check
-anonymous-origin exceptions, toggle-off queue retention, rate rescore while
-disabled, expired callback payloads, startup queue seeding, production worker
-invocation, and the callback group-only and Bot API failure branches. Add one
-RED test for each confirmed behavioral difference before modifying code.
+The ordinary-member, creator-only, and GroupAnonymousBot actor lookup branches
+are complete. Next check original-message anonymous-origin exceptions,
+toggle-off queue retention, rate rescore while disabled, expired callback
+payloads, startup queue seeding, production worker invocation, and the callback
+group-only and remaining Bot API failure branches. Add one RED test for each
+confirmed behavioral difference before modifying code.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
 fresh structural callsite inventory to select the next non-`/smr` Telegram gap.
