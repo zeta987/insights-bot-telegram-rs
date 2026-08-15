@@ -1093,7 +1093,9 @@ impl RecapStateStore for RedisRecapStateStore {
                     Err(error) => last_error = Some(error),
                 }
                 if attempt < 99 {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    // Cooperative sleep: Go's digger parks its goroutine here, so
+                    // blocking the tokio worker thread would be a deviation.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }
             return Err(last_error.expect("one hundred restore attempts record an error"));
