@@ -193,6 +193,18 @@ confirmed as an in-scope Telegram gap:
   registers every locale bundle under the zh-CN tag; that upstream i18n bug
   is documented, not reproduced.
 
+The bot-join welcome checkpoint closes the audit's last in-scope Telegram
+gap: a `my_chat_member` transition to exactly `member` runs Go's first-join
+flow (`welcome.go:137-184`) — `HasJoinedGroupsBefore` gates the whole body,
+the joiner's raw `language_code` is stored via `set_language`, and the HTML
+welcome message is sent best-effort. Being added directly as administrator
+matches no branch. Four test-backfill checkpoints then landed the audit's
+coverage pool: the endpoint/delivery/cancel edges, the dispatcher and
+feedback end-to-end paths, and the autorecap seeder plus double-requeue
+proof. The capsule dispatch and generation internals remain untested because
+they are module-private behind detached spawns; adding a seam is a deferred
+decision below.
+
 Latest verification before this handoff:
 
 - `cargo fmt --check` reports only the known `src/db/recap_config.rs` and
@@ -201,11 +213,14 @@ Latest verification before this handoff:
   `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
 - `/configure_recap` focused tests passed: 26.
-- Bot-left chat member focused tests passed: 2.
+- Chat member focused tests passed: 6.
 - Chat migration focused tests passed: 3.
-- Manual recap focused tests passed: 19.
+- Manual recap focused tests passed: 28.
 - Subscription focused tests passed: 31.
-- Automatic-recap focused tests passed: worker 10, queue 11, delivery 8.
+- Forwarded recap focused tests passed: 11.
+- Delivery focused tests passed: 17; Redis state focused tests passed: 52.
+- Automatic-recap focused tests passed: worker 11, queue 11, delivery 8,
+  runtime 1.
 
 ## Deferred parity decisions
 
@@ -248,27 +263,20 @@ Telegram callsite, so none was acted on without a decision:
 - Kept Rust hardenings, recorded as intentional: fail-fast
   `TELEGRAM_BOT_API_ENDPOINT` validation, the missing-`error_code` HTTP-status
   fallback in the Rich transport, and fail-fast `REDIS_PORT` parsing.
+- `handle_auto_recap_capsule` and `generate_and_deliver_auto_recap`
+  (`src/services/autorecap.rs`) are module-private and dispatch through
+  detached `tokio::spawn` calls with no completion signal, so they cannot be
+  covered without a src-side seam (`pub(crate)` or an awaitable variant); the
+  repository rejects sleep/poll synchronization in tests.
 
 ## Next required slice
 
-The last confirmed in-scope Telegram gap is the bot-join welcome branch
-(`welcome.go:57-74,137-184`): a `my_chat_member` transition to exactly
-`member` should run the `HasJoinedGroupsBefore` guard, set the group language
-from the adder's `language_code`, and send the HTML welcome message
-best-effort. The DB primitives (`has_joined_before`, `set_language`,
-`find_language`) already exist unwired in `src/db/feature_flags.rs`.
-
-After that, the remaining work is the audit's test-backfill pool (largest
-first): the autorecap production wiring (`spawn_autorecap`,
-`handle_auto_recap_capsule`, `generate_and_deliver_auto_recap`, the concrete
-startup seeder, the double-requeue assertion), the dispatcher fallback and
-expired-feedback-payload end-to-end cases, the live-Redis
-`check_manual_recap_rate` and orphan-batch cancel cases, the duplicate
-reaction-count and recap-table un-toggle cases, the endpoint query/fragment
-rejection branch, and one composition-through-delivery integration test.
-Then resolve the deferred parity decisions above with the user. Port 9487 and
-AyuGram are available for a later live Telegram test after local
-verification.
+Every in-scope non-`/smr` Telegram callsite now has a Rust equivalent or a
+documented approved deviation, and the audit's test-backfill pool is closed
+except for the module-private autorecap internals noted above. The remaining
+work is decision-bound rather than mechanical: resolve the deferred parity
+decisions above with the user, then optionally run the live Telegram test —
+port 9487 and AyuGram are available after local verification.
 
 ## Mandatory repository rules
 
@@ -297,7 +305,7 @@ available, read its latest messages too. Then check `.git/index.lock`, current
 branch, latest signed commits, and the unstaged/staged diff without reading any
 `.env*` file. Preserve the completed automatic-recap checkpoint and continue
 the pinned Go v1.0.0 1:1 port from the audit and next-gap procedure described
-above. Begin with the bot-join welcome slice under `Next required slice`; do not
+above. Begin with the deferred parity decisions under `Next required slice`; do not
 broadly refactor existing handlers. Do not redo
 completed modules merely because their implementation is
 unfamiliar: compare production callsites and tests first. Use TDD, keep edits
