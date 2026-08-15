@@ -1,6 +1,6 @@
 //! Go v1.0.0 public manual-recap callback and presentation primitives.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use teloxide::{
@@ -35,6 +35,12 @@ pub const AUTO_RECAP_SEND_MODE_PUBLICLY: i64 = 0;
 pub const AUTO_RECAP_SEND_MODE_ONLY_PRIVATE_SUBSCRIPTIONS: i64 = 1;
 pub const RECAP_SELECT_HOURS: [i64; 6] = [1, 2, 4, 6, 12, 24];
 
+/// Go's `pkg/bots/tgbot/handler.go:135` default text, used by
+/// `processExceptionError` whenever an `ExceptionError` carries no
+/// `WithMessage` override (e.g. the select-hour range check at
+/// `callback_query.go:654`).
+const DEFAULT_EXCEPTION_MESSAGE: &str = "发生了一些错误，请稍后再试";
+
 /// Go's `recap.SelectHourCallbackQueryData`, including field order and JSON
 /// names because the compact bytes determine the callback action hash.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -45,11 +51,25 @@ pub struct SelectHourCallbackData {
     pub recap_mode: i64,
 }
 
+/// Distinguishes Go's two select-hour callback failures
+/// (`callback_query.go:648-655`) so callers can reproduce the exact reply
+/// text Go emits for each: a JSON bind failure carries Go's generation-
+/// failure message, while an hour outside the fixed set carries no message
+/// and falls through to `processExceptionError`'s default text.
+#[derive(Debug)]
+pub enum SelectHourCallbackError {
+    /// `c.BindFromCallbackQueryData(&data)` failed (`callback_query.go:649-651`).
+    Bind(serde_json::Error),
+    /// `data.Hour` is outside `RecapSelectHourAvailable` (`callback_query.go:653-654`).
+    InvalidHour(i64),
+}
+
 impl SelectHourCallbackData {
-    pub fn from_json(payload_json: &str) -> Result<Self> {
-        let data: Self = serde_json::from_str(payload_json)?;
+    pub fn from_json(payload_json: &str) -> std::result::Result<Self, SelectHourCallbackError> {
+        let data: Self =
+            serde_json::from_str(payload_json).map_err(SelectHourCallbackError::Bind)?;
         if !RECAP_SELECT_HOURS.contains(&data.hour) {
-            bail!("invalid hour: {}", data.hour);
+            return Err(SelectHourCallbackError::InvalidHour(data.hour));
         }
         Ok(data)
     }
@@ -317,9 +337,9 @@ pub async fn handle_select_hour_callback(
     payload_json: String,
     context: Arc<AppContext>,
 ) -> ResponseResult<()> {
-    // Telegram's progress spinner is acknowledged before the potentially long
-    // OpenAI work. Go's dispatcher performs the equivalent callback handling.
-    bot.answer_callback_query(callback.id.clone()).await?;
+    // Go's dispatcher never calls answerCallbackQuery for this route
+    // (`callback_query.go` has no such call anywhere in the file), so no
+    // `bot.answer_callback_query` belongs here either.
     let Some(waiting) = callback.message.as_ref() else {
         return Ok(());
     };
@@ -332,13 +352,27 @@ pub async fn handle_select_hour_callback(
 
     let data = match SelectHourCallbackData::from_json(&payload_json) {
         Ok(data) => data,
-        Err(source) => {
+        Err(SelectHourCallbackError::Bind(source)) => {
             error!(?source, "failed to bind manual recap callback payload");
             send_callback_error(
                 &bot,
                 destination_chat_id,
                 reply_to_message_id,
                 "聊天記錄回顧生成失敗，請稍後再試！",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(SelectHourCallbackError::InvalidHour(hour)) => {
+            error!(
+                hour,
+                "manual recap callback selected an hour outside the Go set"
+            );
+            send_callback_error(
+                &bot,
+                destination_chat_id,
+                reply_to_message_id,
+                DEFAULT_EXCEPTION_MESSAGE,
             )
             .await?;
             return Ok(());

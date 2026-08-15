@@ -321,14 +321,6 @@ async fn insert_histories(database: &Database, count: i64) {
 }
 
 async fn mount_telegram_successes(server: &MockServer) {
-    Mock::given(path("/telegram/bottest-token/AnswerCallbackQuery"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "ok": true,
-            "result": true
-        })))
-        .expect(1)
-        .mount(server)
-        .await;
     Mock::given(path("/telegram/bottest-token/EditMessageText"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "ok": true,
@@ -365,14 +357,6 @@ async fn mount_telegram_successes(server: &MockServer) {
 }
 
 async fn mount_telegram_delivery_failure(server: &MockServer) {
-    Mock::given(path("/telegram/bottest-token/AnswerCallbackQuery"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "ok": true,
-            "result": true
-        })))
-        .expect(1)
-        .mount(server)
-        .await;
     Mock::given(path("/telegram/bottest-token/EditMessageText"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "ok": true,
@@ -1091,13 +1075,20 @@ async fn select_hour_callback_generates_votes_sends_rich_and_then_deletes_waitin
     assert_eq!(
         paths,
         [
-            "/telegram/bottest-token/AnswerCallbackQuery",
             "/telegram/bottest-token/EditMessageText",
             "/v1/chat/completions",
             "/v1/chat/completions",
             "/telegram/bottest-token/sendRichMessage",
             "/telegram/bottest-token/DeleteMessage",
         ]
+    );
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|request_path| request_path.contains("AnswerCallbackQuery"))
+            .count(),
+        0,
+        "Go never calls answerCallbackQuery for the select-hour route"
     );
     let rich = requests
         .iter()
@@ -1138,14 +1129,6 @@ async fn select_hour_callback_generates_votes_sends_rich_and_then_deletes_waitin
 #[tokio::test]
 async fn five_histories_reply_with_error_and_keep_the_waiting_message() {
     let server = MockServer::start().await;
-    Mock::given(path("/telegram/bottest-token/AnswerCallbackQuery"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "ok": true,
-            "result": true
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
     Mock::given(path("/telegram/bottest-token/EditMessageText"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "ok": true,
@@ -1206,7 +1189,6 @@ async fn five_histories_reply_with_error_and_keep_the_waiting_message() {
     assert_eq!(
         paths,
         [
-            "/telegram/bottest-token/AnswerCallbackQuery",
             "/telegram/bottest-token/EditMessageText",
             "/telegram/bottest-token/SendMessage",
         ],
@@ -1273,7 +1255,6 @@ async fn delivery_failure_deletes_waiting_before_replying_with_send_error() {
     assert_eq!(
         paths,
         [
-            "/telegram/bottest-token/AnswerCallbackQuery",
             "/telegram/bottest-token/EditMessageText",
             "/v1/chat/completions",
             "/v1/chat/completions",
@@ -1285,6 +1266,118 @@ async fn delivery_failure_deletes_waiting_before_replying_with_send_error() {
     let error_body = request_body(requests.last().expect("send error reply"));
     assert_eq!(error_body["text"], "聊天記錄回顧發送失敗，請稍後再試！");
     assert_eq!(error_body["reply_parameters"]["message_id"], 77);
+}
+
+/// Go's `callback_query.go:653-654` rejects an hour outside the fixed set
+/// with a bare `tgbot.NewExceptionError(...)` and no `WithMessage`, so
+/// `processExceptionError` (`handler.go:117-156`) falls back to its default
+/// text with no edit target, no parse mode, and no keyboard.
+#[tokio::test]
+async fn select_hour_callback_with_out_of_range_hour_sends_the_go_default_exception_text() {
+    let server = MockServer::start().await;
+    Mock::given(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 305,
+                "date": 1_710_000_005,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    // Hand-crafted payload: valid JSON, hour outside {1,2,4,6,12,24}. This
+    // reaches the handler's range check rather than its JSON bind step.
+    let payload =
+        format!(r#"{{"hour":3,"chat_id":{CHAT_ID},"chat_title":"Parity Lab","recap_mode":0}}"#);
+    let wire = state
+        .put_callback(keys::ROUTE_SELECT_HOUR, &payload)
+        .await
+        .expect("store out-of-range select-hour callback");
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query(
+        context.config.telegram.bot(),
+        callback_query(&wire),
+        context,
+    )
+    .await
+    .expect("out-of-range hour callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "no waiting-message edit or generation call precedes the range check"
+    );
+    let body = request_body(&requests[0]);
+    assert_eq!(body["text"], "发生了一些错误，请稍后再试");
+    assert!(
+        body.get("parse_mode").is_none(),
+        "Go's default exception text carries no parse mode"
+    );
+    assert!(
+        body.get("reply_markup").is_none(),
+        "Go's default exception text carries no keyboard"
+    );
+    assert_eq!(
+        body["reply_parameters"]["message_id"], 77,
+        "Go replies to the callback message's reply_to_message"
+    );
+}
+
+/// Go's `callback_query.go:649-651` reports a JSON bind failure with the
+/// generation-failure text, distinct from the range-check's default text
+/// above.
+#[tokio::test]
+async fn select_hour_callback_with_malformed_payload_sends_the_go_generation_failure_text() {
+    let server = MockServer::start().await;
+    Mock::given(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 306,
+                "date": 1_710_000_006,
+                "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Parity Lab"}
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(
+        Arc::new(TestClock::new(START_MS)) as Arc<dyn Clock>,
+    ));
+    let wire = state
+        .put_callback(keys::ROUTE_SELECT_HOUR, "{ this is not json")
+        .await
+        .expect("store malformed select-hour callback");
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query(
+        context.config.telegram.bot(),
+        callback_query(&wire),
+        context,
+    )
+    .await
+    .expect("malformed payload callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests.len(),
+        1,
+        "no waiting-message edit or generation call precedes the bind check"
+    );
+    let body = request_body(&requests[0]);
+    assert_eq!(body["text"], "聊天記錄回顧生成失敗，請稍後再試！");
+    assert_eq!(body["reply_parameters"]["message_id"], 77);
 }
 
 #[test]
