@@ -1,3 +1,5 @@
+use std::{sync::Arc, time::Duration};
+
 use anyhow::{Context, Result};
 use async_openai::{
     Client,
@@ -8,20 +10,58 @@ use async_openai::{
         CreateChatCompletionRequestArgs,
     },
 };
+use async_trait::async_trait;
 
 use crate::{
     config::{CondensedPromptConfig, Locale, OpenAiConfig as OpenAiSettings, RecapOpenAiConfig},
-    db::models::ChatHistory,
+    db::models::{ChatHistory, TokenUsage},
     i18n::I18n,
-    services::prompts::{
-        ANY_SUMMARIZATION_SYSTEM_PROMPT, CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
-        CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_USER_PROMPT,
-        CHECK_SUMMARY_JSON_SYSTEM_PROMPT, CHECK_SUMMARY_JSON_USER_PROMPT,
-        ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, PromptConfig, StructuredSummary,
-        TopicSummary, render_any_summarization_user_prompt, render_one_chat_history_user_prompt,
-        render_structured_summary_user_prompt,
+    services::{
+        prompts::{
+            ANY_SUMMARIZATION_SYSTEM_PROMPT, CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
+            CHECK_CONDENSED_OUTPUT_SYSTEM_PROMPT, CHECK_CONDENSED_OUTPUT_USER_PROMPT,
+            CHECK_SUMMARY_JSON_SYSTEM_PROMPT, CHECK_SUMMARY_JSON_USER_PROMPT,
+            ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT, PromptConfig, StructuredSummary,
+            TopicSummary, render_any_summarization_user_prompt,
+            render_one_chat_history_user_prompt, render_structured_summary_user_prompt,
+        },
+        rate_limit::GoRateLimiter,
     },
 };
+
+/// Go builds the OpenAI limiter as `ratelimit.New(1)` in `openai.NewClient`.
+pub const GO_OPENAI_REQUESTS_PER_SECOND: u32 = 1;
+
+/// Go's `SetPromptOperation("Summarize Any")`.
+pub const SUMMARIZE_ANY_OPERATION: &str = "Summarize Any";
+
+/// Go's `SetPromptOperation("Summarize One Chat History")`.
+pub const SUMMARIZE_ONE_CHAT_HISTORY_OPERATION: &str = "Summarize One Chat History";
+
+/// The seam for Go's `enableMetricRecordForTokens` side effect.
+///
+/// Go writes a `metric_open_ai_chat_completion_token_usages` row through
+/// `c.ent` after a successful completion, and only logs a write failure. That
+/// side effect needs a datastore handle, and this client has none: `OpenAiClient`
+/// holds an `async_openai::Client` and prompt configuration, never a
+/// [`crate::db::Database`]. Rather than invent a DB dependency inside this
+/// slice, the usage is reported here and a caller that owns a pool can forward
+/// it to [`crate::db::usage_metrics::create`], which is already ported and
+/// takes exactly this shape.
+///
+/// No recorder installed is Go's `enableMetricRecordForTokens == false`, where
+/// the whole block is skipped.
+#[async_trait]
+pub trait TokenUsageRecorder: Send + Sync {
+    /// `model_name` is Go's `c.modelName`, the model that was *requested*, not
+    /// the `model` the response echoes back.
+    async fn record(
+        &self,
+        prompt_operation: &str,
+        usage: TokenUsage,
+        model_name: &str,
+    ) -> Result<()>;
+}
 
 #[derive(Clone)]
 pub struct OpenAiClient {
@@ -32,6 +72,10 @@ pub struct OpenAiClient {
     pub check_model_backup: Option<String>,
     token_limit: Option<u32>,
     pub prompt_config: PromptConfig,
+    /// Go's `c.limiter`, shared by every clone as it is shared by every
+    /// goroutine holding one `*OpenAIClient`.
+    limiter: Arc<GoRateLimiter>,
+    token_usage_recorder: Option<Arc<dyn TokenUsageRecorder>>,
 }
 
 impl OpenAiClient {
@@ -44,11 +88,24 @@ impl OpenAiClient {
         if let Some(base) = &cfg.api_base {
             builder = builder.with_api_base(base);
         }
-        let client = Client::with_config(builder);
+        // `go-openai` returns the first API or transport error. async-openai's
+        // default retries 429 and every 5xx for up to fifteen minutes, which
+        // would change both request count and latency. A zero retry window
+        // preserves the first attempt while preventing a second one.
+        let retry_policy = backoff::ExponentialBackoff {
+            max_elapsed_time: Some(Duration::ZERO),
+            ..Default::default()
+        };
+        let client = Client::with_config(builder).with_backoff(retry_policy);
         let prompt_config = PromptConfig::from_config(recap, condensed);
         let sarcastic_model = Some(recap.condensed_model.clone());
         let check_model = recap.check_model.clone();
         let check_model_backup = recap.check_backups.first().cloned();
+
+        // Go's `NewClient` builds the limiter and immediately takes from it,
+        // which moves the first permission issue one second into the future.
+        let limiter = Arc::new(GoRateLimiter::per_second(GO_OPENAI_REQUESTS_PER_SECOND));
+        limiter.prime();
 
         Ok(Self {
             client,
@@ -58,7 +115,29 @@ impl OpenAiClient {
             check_model_backup,
             token_limit: u32::try_from(recap.token_limit).ok(),
             prompt_config,
+            limiter,
+            token_usage_recorder: None,
         })
+    }
+
+    /// Replace the limiter, the way Go's tests hand in `ratelimit.New(1000)`
+    /// so a completion is not throttled to one per second.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, limiter: Arc<GoRateLimiter>) -> Self {
+        self.limiter = limiter;
+        self
+    }
+
+    /// Install the [`TokenUsageRecorder`], which is Go's
+    /// `enableMetricRecordForTokens = true`.
+    #[must_use]
+    pub fn with_token_usage_recorder(mut self, recorder: Arc<dyn TokenUsageRecorder>) -> Self {
+        self.token_usage_recorder = Some(recorder);
+        self
+    }
+
+    pub fn rate_limiter(&self) -> &Arc<GoRateLimiter> {
+        &self.limiter
     }
 
     /// Sarcastic condensed single-sentence summary with emoji.
@@ -98,7 +177,6 @@ impl OpenAiClient {
                 "Summary unavailable.".to_string()
             });
 
-        tracing::debug!("sarcastic_condense raw response: {:?}", text);
         Ok(text.trim().to_string())
     }
 
@@ -145,14 +223,12 @@ impl OpenAiClient {
             .and_then(|c| c.message.content.clone())
             .unwrap_or_else(|| "[]".to_string());
 
-        tracing::debug!("recap_structured_locale raw response: {}", raw_text);
-
         // Try to extract JSON from response (may be wrapped in markdown code block)
         let json_text = extract_json_from_response(&raw_text);
 
         // Try to parse JSON, return raw text alongside for potential check model repair.
-        let summary: StructuredSummary = serde_json::from_str(&json_text).unwrap_or_else(|e| {
-            tracing::warn!("Failed to parse structured summary JSON: {e}");
+        let summary: StructuredSummary = serde_json::from_str(&json_text).unwrap_or_else(|_| {
+            tracing::warn!("failed to parse structured summary JSON");
             Vec::new()
         });
 
@@ -340,8 +416,8 @@ impl OpenAiClient {
                     text
                 }
             }
-            Err(e) => {
-                tracing::warn!("sarcastic_condense failed: {e:?}");
+            Err(_) => {
+                tracing::warn!("sarcastic_condense failed");
                 "Summary generation failed".to_string()
             }
         };
@@ -385,8 +461,8 @@ impl OpenAiClient {
                     )
                 }
             }
-            Err(e) => {
-                tracing::warn!("recap_structured_locale failed: {e:?}");
+            Err(_) => {
+                tracing::warn!("recap_structured_locale failed");
                 let fallback = "Segmented summary generation failed".to_string();
                 (fallback.clone(), fallback)
             }
@@ -409,6 +485,7 @@ impl OpenAiClient {
         self.summarize_with(
             ANY_SUMMARIZATION_SYSTEM_PROMPT,
             render_any_summarization_user_prompt(content),
+            SUMMARIZE_ANY_OPERATION,
             "summarize any failed",
         )
         .await
@@ -419,6 +496,7 @@ impl OpenAiClient {
         self.summarize_with(
             ONE_CHAT_HISTORY_SUMMARIZATION_SYSTEM_PROMPT,
             render_one_chat_history_user_prompt(chat_history),
+            SUMMARIZE_ONE_CHAT_HISTORY_OPERATION,
             "summarize one chat history failed",
         )
         .await
@@ -426,12 +504,26 @@ impl OpenAiClient {
 
     /// The shared shape of Go's two preprocessing completions: primary model,
     /// one system message, one user message, and no token ceiling.
+    ///
+    /// Go's ordering is load-bearing and reproduced exactly:
+    ///
+    /// 1. `c.limiter.Take()` runs first, once, before the prompt is even
+    ///    rendered, so a call that goes on to fail has still consumed its
+    ///    permission.
+    /// 2. `c.modelName` is the model. Neither helper consults the backup model
+    ///    list that `SummarizeChatHistories` falls back through.
+    /// 3. A transport or API error returns immediately and records no metric.
+    /// 4. Only a successful response reaches the metric block, and a metric
+    ///    write failure never fails the call.
     async fn summarize_with(
         &self,
         system_prompt: &str,
         user_prompt: String,
+        prompt_operation: &str,
         failure_context: &'static str,
     ) -> Result<Vec<String>> {
+        self.limiter.take().await;
+
         let req = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages(vec![
@@ -452,6 +544,35 @@ impl OpenAiClient {
             .create(req)
             .await
             .context(failure_context)?;
+
+        if let Some(recorder) = &self.token_usage_recorder {
+            // Go reads `resp.Usage` unconditionally; an absent usage object is
+            // Go's zero-valued struct.
+            let usage = resp.usage.as_ref();
+            let record_result = recorder
+                .record(
+                    prompt_operation,
+                    TokenUsage {
+                        prompt_tokens: usage
+                            .map(|usage| i64::from(usage.prompt_tokens))
+                            .unwrap_or(0),
+                        completion_tokens: usage
+                            .map(|usage| i64::from(usage.completion_tokens))
+                            .unwrap_or(0),
+                        total_tokens: usage
+                            .map(|usage| i64::from(usage.total_tokens))
+                            .unwrap_or(0),
+                    },
+                    &self.model,
+                )
+                .await;
+            if record_result.is_err() {
+                // Go logs metric persistence failures and still returns the
+                // successful completion. Keep the log generic so neither
+                // response details nor configured endpoint data are emitted.
+                tracing::error!("failed to record OpenAI token usage");
+            }
+        }
 
         Ok(resp
             .choices

@@ -729,8 +729,9 @@ pub fn go_string_from_bytes(bytes: &[u8]) -> String {
 /// A [`LinkPreviewer`] that always fails, which Go treats as "leave the URL
 /// alone".
 ///
-/// The HTTP and HTML5 side of `linkprev` is not ported yet, so this keeps the
-/// preprocessor constructible without inventing preview titles.
+/// [`crate::services::link_preview::HttpLinkPreviewer`] is the production
+/// implementation; this one stays as the offline seam, both for deployments
+/// with no outbound HTTP and for tests that must never open a socket.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnavailableLinkPreviewer;
 
@@ -772,16 +773,58 @@ impl Summarizer for OpenAiSummarizer {
     }
 }
 
-/// Builds a [`CapturedMessage`] from a teloxide message.
+/// Go's `tgbotapi.MessageEntity`, read through teloxide's typed entity.
+///
+/// # The `text_link` href is normalised, and that is observable
+///
+/// Telegram's Bot API sends a `text_link` entity as
+/// `{"type":"text_link","offset":..,"length":..,"url":"<raw string>"}`, and
+/// `go-telegram-bot-api` stores `URL string`, so Go's
+/// `href = entity.URL` is byte-for-byte what Telegram sent.
+///
+/// teloxide types the same field as
+/// `MessageEntityKind::TextLink { url: reqwest::Url }`
+/// (`teloxide-core-0.11.2/src/types/message_entity.rs`), so serde runs
+/// `Url::parse` during deserialization and the raw string is gone by the time
+/// any handler sees the message. Recovering it means `Url::to_string`, which
+/// returns the WHATWG serialization, not the input:
+///
+/// | Telegram sends            | Go's `entity.URL`         | this adapter               |
+/// |---------------------------|---------------------------|----------------------------|
+/// | `https://example.com`     | `https://example.com`     | `https://example.com/`     |
+/// | `HTTPS://Example.COM/a`   | `HTTPS://Example.COM/a`   | `https://example.com/a`    |
+/// | `https://例え.jp/`        | `https://例え.jp/`        | `https://xn--r8jz45g.jp/`  |
+///
+/// The difference reaches the stored chat history, because the href goes
+/// straight into `[title](href)`. It is unavoidable at the typed `Message`
+/// level: the only way back to the raw string is parsing the raw `Update` JSON,
+/// which is out of scope for this slice. `tests/message_entity_tests.rs` pins
+/// the exact strings above.
 ///
 /// Telegram's `offset` and `length` are already UTF-16 code unit counts, and
-/// teloxide keeps them that way, so they are carried over untouched.
+/// teloxide keeps them that way, so those are carried over untouched.
+pub fn captured_entity_from_teloxide(entity: &teloxide::types::MessageEntity) -> CapturedEntity {
+    use teloxide::types::MessageEntityKind;
+
+    CapturedEntity {
+        kind: match &entity.kind {
+            MessageEntityKind::Url => CapturedEntityKind::Url,
+            MessageEntityKind::TextLink { url } => CapturedEntityKind::TextLink {
+                url: url.to_string(),
+            },
+            _ => CapturedEntityKind::Other,
+        },
+        offset: entity.offset,
+        length: entity.length,
+    }
+}
+
+/// Builds a [`CapturedMessage`] from a teloxide message.
 ///
-/// One representation difference is worth knowing before this is wired up:
-/// teloxide parses a `text_link` href into a `Url`, so the string recovered
-/// here is the normalised form, whereas Go keeps Telegram's raw `entity.url`.
+/// See [`captured_entity_from_teloxide`] for the one representation difference
+/// against Go: the `text_link` href arrives here normalised.
 pub fn captured_message_from_teloxide(message: &teloxide::types::Message) -> CapturedMessage {
-    use teloxide::types::{MessageEntity, MessageEntityKind};
+    use teloxide::types::MessageEntity;
 
     fn chat_kind(chat: &teloxide::types::Chat) -> String {
         if chat.is_private() {
@@ -817,17 +860,7 @@ pub fn captured_message_from_teloxide(message: &teloxide::types::Message) -> Cap
         entities
             .unwrap_or_default()
             .iter()
-            .map(|entity| CapturedEntity {
-                kind: match &entity.kind {
-                    MessageEntityKind::Url => CapturedEntityKind::Url,
-                    MessageEntityKind::TextLink { url } => CapturedEntityKind::TextLink {
-                        url: url.to_string(),
-                    },
-                    _ => CapturedEntityKind::Other,
-                },
-                offset: entity.offset,
-                length: entity.length,
-            })
+            .map(captured_entity_from_teloxide)
             .collect()
     }
 

@@ -7,9 +7,11 @@ edition = "2024"
 anyhow = "1"
 async-trait = "0.1"
 async-openai = { version = "0.28", default-features = false, features = ["rustls-webpki-roots"] }
+backoff = { version = "0.4", features = ["tokio"] }
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
+encoding_rs = "0.8"
 futures = "0.3"
 governor = { version = "0.6", features = ["dashmap"] }
 axum = { version = "0.7", features = ["macros"] }
@@ -36,7 +38,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 nonzero_ext = "0.3"
 reqwest = { version = "0.12.24", features = ["json"] }
 regex = "1"
+scraper = "0.27"
 gtmpl = "0.7.1"
+mime = "0.3"
 redis = { version = "1.5", default-features = false, features = [
     "connection-manager",
     "cache-aio",
