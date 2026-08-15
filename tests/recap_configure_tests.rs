@@ -204,6 +204,12 @@ fn anonymous_configure_callback(wire: &str) -> CallbackQuery {
     serde_json::from_value(value).expect("anonymous configure callback")
 }
 
+fn configure_callback_with_markup(wire: &str, markup: &Value) -> CallbackQuery {
+    let mut value = serde_json::to_value(configure_callback(wire)).expect("serialize callback");
+    value["message"]["reply_markup"] = markup.clone();
+    serde_json::from_value(value).expect("configure callback with markup")
+}
+
 fn request_body(request: &wiremock::Request) -> Value {
     serde_json::from_slice(&request.body).unwrap_or_else(|_| {
         let map = url::form_urlencoded::parse(&request.body)
@@ -469,6 +475,10 @@ async fn configure_command_checks_bot_and_actor_and_keeps_missing_options_epheme
     assert_eq!(request_body(&requests[0])["user_id"], 9_999);
     assert_eq!(request_body(&requests[1])["user_id"], FROM_ID);
     let response = request_body(&requests[2]);
+    assert!(
+        response.get("parse_mode").is_none(),
+        "Go sends the configure command response without parse_mode"
+    );
     assert_eq!(
         response["text"],
         "好的。请在下面点击你想配置的选项进行操作吧。"
@@ -580,6 +590,10 @@ async fn toggle_on_creates_usable_options_enables_recap_and_queues_the_chat() {
         ]
     );
     let response = request_body(&requests[2]);
+    assert!(
+        response.get("parse_mode").is_none(),
+        "Go sends toggle success without parse_mode"
+    );
     assert_eq!(
         response["text"],
         "好的。请在下面点击你想配置的选项进行操作吧。\n\n聊天记录回顾功能已开启，开启后将会自动收集群组中的聊天记录并定时发送聊天回顾快报。"
@@ -853,6 +867,10 @@ async fn pin_off_preserves_go_old_options_and_recap_status_wiring_bug() {
     );
     let requests = server.received_requests().await.expect("Telegram requests");
     let response = request_body(&requests[2]);
+    assert!(
+        response.get("parse_mode").is_none(),
+        "Go sends pin success without parse_mode"
+    );
     let markup: Value = match &response["reply_markup"] {
         Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
         value => value.clone(),
@@ -1216,4 +1234,63 @@ async fn group_anonymous_bot_is_looked_up_before_every_admin_exception() {
         3,
         "Go queries membership before applying each GroupAnonymousBot exception"
     );
+}
+
+#[tokio::test]
+async fn expired_toggle_edits_plain_error_and_preserves_the_existing_keyboard() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let clock = Arc::new(TestClock::new(START_MS));
+    let state = Arc::new(InMemoryRecapStateStore::new(clock.clone()));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("enabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wire = keyboard["inline_keyboard"][1][0]["callback_data"]
+        .as_str()
+        .expect("toggle callback")
+        .to_owned();
+    clock.advance_ms(86_400_000);
+    let context = command_context(&server, database, state).await;
+
+    RecapHandlers::handle_callback_query_with_me(
+        context.config.telegram.bot(),
+        configure_callback_with_markup(&wire, &keyboard),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("expired toggle callback");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(requests.len(), 1);
+    let edit = request_body(&requests[0]);
+    assert_eq!(
+        edit["text"],
+        "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾功能的配置时出现了问题，请稍后再试！"
+    );
+    assert!(edit.get("parse_mode").is_none());
+    let retained_markup: Value = match &edit["reply_markup"] {
+        Value::String(raw) => serde_json::from_str(raw).expect("reply markup JSON"),
+        value => value.clone(),
+    };
+    assert_eq!(retained_markup, keyboard);
 }

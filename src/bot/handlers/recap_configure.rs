@@ -276,9 +276,38 @@ async fn edit_configuration(
     let Some(message) = callback.message.as_ref() else {
         return Ok(());
     };
+    let mut request = bot.edit_message_text(message.chat().id, message.id(), text);
+    let markup = markup.or_else(|| {
+        message
+            .regular_message()
+            .and_then(Message::reply_markup)
+            .cloned()
+    });
+    if let Some(markup) = markup {
+        request = request.reply_markup(markup);
+    }
+    request.await?;
+    Ok(())
+}
+
+async fn edit_configuration_html(
+    bot: &Bot,
+    callback: &CallbackQuery,
+    text: &str,
+    markup: Option<InlineKeyboardMarkup>,
+) -> ResponseResult<()> {
+    let Some(message) = callback.message.as_ref() else {
+        return Ok(());
+    };
     let mut request = bot
         .edit_message_text(message.chat().id, message.id(), text)
         .parse_mode(ParseMode::Html);
+    let markup = markup.or_else(|| {
+        message
+            .regular_message()
+            .and_then(Message::reply_markup)
+            .cloned()
+    });
     if let Some(markup) = markup {
         request = request.reply_markup(markup);
     }
@@ -325,7 +354,7 @@ pub async fn handle_toggle_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
     let actor_is_admin =
         match check_admin_or_anonymous_permission(&bot, message, &callback.from).await {
@@ -445,7 +474,7 @@ pub async fn handle_assign_mode_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
     let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
     {
@@ -459,7 +488,7 @@ pub async fn handle_assign_mode_callback(
         CreatorOnlyPermission::Allowed => {}
         CreatorOnlyPermission::SilentDeny => return Ok(()),
         CreatorOnlyPermission::VisibleDeny => {
-            return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+            return edit_configuration_html(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
         }
     }
     let Some(mode) = AutoRecapSendMode::from_stored(data.mode) else {
@@ -520,7 +549,7 @@ pub async fn handle_assign_mode_callback(
             "{CONFIGURE_HEADER}\n\n聊天记录回顾模式已切换为<b>私聊</b>，将会自动收集群组中的聊天记录并定时发送聊天回顾快报给通过 /subscribe_recap 命令订阅了本群组聊天回顾用户。"
         )
     };
-    edit_configuration(&bot, &callback, &text, Some(keyboard)).await
+    edit_configuration_html(&bot, &callback, &text, Some(keyboard)).await
 }
 
 /// Apply the creator-only daily frequency and immediately rescore the one
@@ -560,7 +589,7 @@ pub async fn handle_rates_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
     let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
     {
@@ -574,7 +603,7 @@ pub async fn handle_rates_callback(
         CreatorOnlyPermission::Allowed => {}
         CreatorOnlyPermission::SilentDeny => return Ok(()),
         CreatorOnlyPermission::VisibleDeny => {
-            return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+            return edit_configuration_html(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
         }
     }
     if let Err(error) =
@@ -642,7 +671,7 @@ pub async fn handle_rates_callback(
         "{CONFIGURE_HEADER}\n\n每天自动创建聊天回顾的频率次数已设定为 <b>{}</b>，将会自动收集群组中的聊天记录并在 {schedule} 发送聊天回顾快报。",
         data.rates
     );
-    edit_configuration(&bot, &callback, &text, Some(keyboard)).await
+    edit_configuration_html(&bot, &callback, &text, Some(keyboard)).await
 }
 
 /// Apply Go's creator-only pin option, including its visible wiring quirk:
@@ -676,7 +705,7 @@ pub async fn handle_pin_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration_html(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
     let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
     {
@@ -690,7 +719,7 @@ pub async fn handle_pin_callback(
         CreatorOnlyPermission::Allowed => {}
         CreatorOnlyPermission::SilentDeny => return Ok(()),
         CreatorOnlyPermission::VisibleDeny => {
-            return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+            return edit_configuration_html(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
         }
     }
     let chat_id = message.chat.id.0;

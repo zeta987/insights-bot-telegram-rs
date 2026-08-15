@@ -79,8 +79,13 @@ success-only audit originally missed:
 - Command, toggle, and complete now query GroupAnonymousBot membership before
   applying the exception, so a Bot API error follows Go's error path instead of
   continuing the mutation.
-- Three RED-to-GREEN transport tests raise the focused configuration total to
-  ten.
+- Configuration edits now preserve Go's parse-mode split: toggle and pin
+  success plus ordinary errors omit `parse_mode`; mode, rate, and HTML
+  permission errors use `HTML`.
+- An expired configure callback receives the fixed plain error edit and the
+  existing inline keyboard is sent back unchanged.
+- Four RED-to-GREEN transport tests raise the focused configuration total to
+  eleven.
 
 The current automatic-recap checkpoint adds:
 
@@ -110,7 +115,7 @@ Latest verification before this handoff:
 
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
-- `/configure_recap` focused tests passed: 10.
+- `/configure_recap` focused tests passed: 11.
 - Automatic-recap focused tests passed: worker 9, queue 11, delivery 8.
 
 ## Next required slice
@@ -119,10 +124,10 @@ Continue the read-only pinned-Go versus Rust audit of the completed automatic
 worker and configuration runtime; passing tests do not prove every error branch.
 The ordinary-member, creator-only, and GroupAnonymousBot actor lookup branches
 are complete. Next check original-message anonymous-origin exceptions,
-toggle-off queue retention, rate rescore while disabled, expired callback
-payloads, startup queue seeding, production worker invocation, and the callback
-group-only and remaining Bot API failure branches. Add one RED test for each
-confirmed behavioral difference before modifying code.
+toggle-off queue retention, rate rescore while disabled, startup queue seeding,
+production worker invocation, and the callback group-only and remaining Bot API
+failure branches. Add one RED test for each confirmed behavioral difference
+before modifying code.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
 fresh structural callsite inventory to select the next non-`/smr` Telegram gap.
