@@ -40,6 +40,14 @@ async fn register_commands(bot: &Bot) -> Result<()> {
         BotCommand::new("cancel", "Cancel current operation"),
         BotCommand::new("recap", "Generate chat recap"),
         BotCommand::new("configure_recap", "Configure recap settings"),
+        BotCommand::new(
+            "recap_forwarded_start",
+            "使 Bot 接收在私聊中转发给 Bot 的消息，并在发送 /recap_forwarded 后开始总结",
+        ),
+        BotCommand::new(
+            "recap_forwarded",
+            "使 Bot 停止接收在私聊中转发给 Bot 的消息，对已经转发过的消息进行总结",
+        ),
         BotCommand::new("subscribe_recap", "订阅当前群组的定时聊天回顾"),
         BotCommand::new("unsubscribe_recap", "取消订阅当前群组的定时聊天回顾"),
     ];

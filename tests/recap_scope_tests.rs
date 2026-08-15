@@ -1,5 +1,5 @@
 use insights_bot_telegram_rs::{
-    bot::commands::Command,
+    bot::commands::{Command, parse_go_command},
     db::{
         Database, DbBackend, chat_history, migration, models::MessageKind, models::RecapConfig,
         recap_config,
@@ -72,6 +72,8 @@ fn command_surface_only_lists_supported_commands() {
         "/cancel",
         "/recap",
         "/configure_recap",
+        "/recap_forwarded_start",
+        "/recap_forwarded",
         "/subscribe_recap",
         "/unsubscribe_recap",
     ] {
@@ -81,12 +83,20 @@ fn command_surface_only_lists_supported_commands() {
         );
     }
 
-    for removed in ["/recap_forwarded_start", "/recap_forwarded"] {
-        assert!(
-            !descriptions.contains(removed),
-            "removed command {removed} should not be listed"
-        );
-    }
+    assert!(Command::parse("/recap_forwarded_start", "TestBot").is_ok());
+    assert!(Command::parse("/recap_forwarded", "TestBot").is_ok());
+}
+
+#[test]
+fn go_command_parser_ignores_mentions_and_forwarded_arguments() {
+    assert!(matches!(
+        parse_go_command("/recap_forwarded_start@OtherBot ignored", "TestBot"),
+        Some(Command::RecapForwardedStart)
+    ));
+    assert!(matches!(
+        parse_go_command("/recap_forwarded@OtherBot ignored", "TestBot"),
+        Some(Command::RecapForwarded)
+    ));
 }
 
 #[test]

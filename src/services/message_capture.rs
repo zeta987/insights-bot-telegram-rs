@@ -31,12 +31,15 @@
 //! including UTF-16 ranges that cut a surrogate pair in half: those decode to
 //! U+FFFD here just as `utf16.Decode` produces U+FFFD in Go.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::future::join_all;
-use serde::Serialize;
+use serde::{
+    Deserialize, Serialize,
+    de::{IgnoredAny, MapAccess, Visitor},
+};
 use tracing::warn;
 
 use crate::db::models::NewTelegramChatHistory;
@@ -136,7 +139,7 @@ pub struct EditedMessageCapture {
 /// is compact, because Go's `json.Marshal` emits no whitespace. The Redis
 /// member is that exact byte string, so any drift here changes what a replay
 /// session reads back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PrivateForwardedReplayChatHistory {
     pub chat_id: i64,
     pub chat_type: String,
@@ -147,6 +150,88 @@ pub struct PrivateForwardedReplayChatHistory {
     pub actor_display_name: String,
     pub text: String,
     pub chatted_at: i64,
+}
+
+impl<'de> Deserialize<'de> for PrivateForwardedReplayChatHistory {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(PrivateForwardedReplayVisitor)
+    }
+}
+
+struct PrivateForwardedReplayVisitor;
+
+impl<'de> Visitor<'de> for PrivateForwardedReplayVisitor {
+    type Value = PrivateForwardedReplayChatHistory;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a private forwarded replay object or null")
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self::Value::default())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Self::Value::default())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut value = Self::Value::default();
+        while let Some(key) = map.next_key::<String>()? {
+            if key.eq_ignore_ascii_case("chat_id") {
+                if let Some(field) = map.next_value::<Option<i64>>()? {
+                    value.chat_id = field;
+                }
+            } else if key.eq_ignore_ascii_case("chat_type") {
+                if let Some(field) = map.next_value::<Option<String>>()? {
+                    value.chat_type = field;
+                }
+            } else if key.eq_ignore_ascii_case("chat_title") {
+                if let Some(field) = map.next_value::<Option<String>>()? {
+                    value.chat_title = field;
+                }
+            } else if key.eq_ignore_ascii_case("message_id") {
+                if let Some(field) = map.next_value::<Option<i64>>()? {
+                    value.message_id = field;
+                }
+            } else if key.eq_ignore_ascii_case("actor_id") {
+                if let Some(field) = map.next_value::<Option<i64>>()? {
+                    value.actor_id = field;
+                }
+            } else if key.eq_ignore_ascii_case("actor_username") {
+                if let Some(field) = map.next_value::<Option<String>>()? {
+                    value.actor_username = field;
+                }
+            } else if key.eq_ignore_ascii_case("actor_display_name") {
+                if let Some(field) = map.next_value::<Option<String>>()? {
+                    value.actor_display_name = field;
+                }
+            } else if key.eq_ignore_ascii_case("text") {
+                if let Some(field) = map.next_value::<Option<String>>()? {
+                    value.text = field;
+                }
+            } else if key.eq_ignore_ascii_case("chatted_at") {
+                if let Some(field) = map.next_value::<Option<i64>>()? {
+                    value.chatted_at = field;
+                }
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(value)
+    }
 }
 
 /// Go's `SaveOneTelegramPrivateForwardedReplayChatHistory`, from the extracted

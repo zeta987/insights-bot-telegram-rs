@@ -158,7 +158,13 @@ async fn record_private_message(
     }
 
     let entry = private_forwarded_replay_entry(message, &text);
-    let Ok(json) = serde_json::to_string(&entry) else {
+    let Ok(json) = serde_json::to_string(&entry).map(|json| {
+        json.replace('&', "\\u0026")
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e")
+            .replace('\u{2028}', "\\u2028")
+            .replace('\u{2029}', "\\u2029")
+    }) else {
         warn!("failed to serialize a forwarded replay entry");
         return;
     };

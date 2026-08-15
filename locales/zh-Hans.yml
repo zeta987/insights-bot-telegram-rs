@@ -10,9 +10,11 @@ system:
     /cancel - 取消当前操作
     /recap - 生成聊天回顾
     /configure_recap - 配置回顾设置
+    /recap_forwarded_start - 使 Bot 接收在私聊中转发给 Bot 的消息，并在发送 /recap_forwarded 后开始总结
+    /recap_forwarded - 使 Bot 停止接收在私聊中转发给 Bot 的消息，对已经转发过的消息进行总结
     /subscribe_recap - 订阅定时聊天回顾
     /unsubscribe_recap - 取消订阅定时聊天回顾
-  cancel: "操作已取消。"
+  cancel: "已经没有正在进行的操作了"
 
 # 回顾相关消息
 recap:

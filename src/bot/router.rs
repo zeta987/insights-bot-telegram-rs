@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use teloxide::{RequestError, dispatching::DefaultKey, dptree, prelude::*};
+use teloxide::{RequestError, dispatching::DefaultKey, dptree, prelude::*, types::Me};
 
 use crate::bot::{
-    commands::Command,
+    commands::{Command, parse_go_command},
     context::AppContext,
     handlers::{
-        migration::MigrationHandlers, recap::RecapHandlers, recap_subscription,
+        migration::MigrationHandlers, recap::RecapHandlers, recap_forwarded, recap_subscription,
         system::SystemHandlers,
     },
     middleware,
@@ -17,13 +17,26 @@ pub fn build_dispatcher(
     ctx: Arc<AppContext>,
 ) -> Dispatcher<Bot, RequestError, DefaultKey> {
     let commands = dptree::entry()
-        .filter_command::<Command>()
+        .filter_map(|message: Message, me: Me| {
+            message
+                .text()
+                .or_else(|| message.caption())
+                .and_then(|text| parse_go_command(text, me.username()))
+        })
         .branch(dptree::case![Command::Start(arguments)].endpoint(SystemHandlers::handle_start))
         .branch(dptree::case![Command::Help].endpoint(SystemHandlers::handle_help))
         .branch(dptree::case![Command::Cancel].endpoint(SystemHandlers::handle_cancel))
         .branch(dptree::case![Command::Recap].endpoint(RecapHandlers::handle_recap))
         .branch(
             dptree::case![Command::ConfigureRecap].endpoint(RecapHandlers::handle_configure_recap),
+        )
+        .branch(
+            dptree::case![Command::RecapForwardedStart]
+                .endpoint(recap_forwarded::handle_recap_forwarded_start),
+        )
+        .branch(
+            dptree::case![Command::RecapForwarded]
+                .endpoint(recap_forwarded::handle_recap_forwarded),
         )
         .branch(
             dptree::case![Command::SubscribeRecap]

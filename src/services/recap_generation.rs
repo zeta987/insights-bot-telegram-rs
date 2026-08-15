@@ -10,6 +10,7 @@ use crate::{
         recap_logs, usage_metrics,
     },
     services::{
+        message_capture::PrivateForwardedReplayChatHistory,
         openai::{CondensedGenerationError, CondensedResult, OpenAiClient, TokenUsageRecorder},
         rich_recap::{
             CondensedExecutionTrace, GenerationModelExecutionTrace, RecapExecutionTrace,
@@ -145,9 +146,87 @@ impl RecapGenerationService {
         histories: &[TelegramChatHistory],
     ) -> Result<GroupDetailedRecap, DetailedRecapGenerationError> {
         let (recap_inputs, virtual_to_real) = build_rich_recap_prompt(histories);
+        let raw = self.summarize_detailed_inputs(&recap_inputs).await?;
+        let resolved_summaries = raw
+            .summaries
+            .into_iter()
+            .filter_map(|summary| {
+                let sanitized = sanitize_detailed_recap_markdown(&summary);
+                let resolved =
+                    resolve_rich_recap_references(&sanitized, chat_id, chat_type, &virtual_to_real);
+                let resolved = resolved.trim().to_owned();
+                (!resolved.is_empty()).then_some(resolved)
+            })
+            .collect::<Vec<_>>();
+
+        persist_group_detailed_recap(
+            &self.database,
+            chat_id,
+            &recap_inputs,
+            resolved_summaries,
+            raw.usage,
+            raw.trace.clone(),
+            &self.configured_model,
+        )
+        .await
+        .map_err(|source| DetailedRecapGenerationError {
+            source,
+            usage: raw.usage,
+            trace: raw.trace,
+        })
+    }
+
+    /// Generate and persist Go's private-forwarded detailed recap.
+    pub async fn summarize_private_forwarded_histories(
+        &self,
+        user_id: i64,
+        histories: &[PrivateForwardedReplayChatHistory],
+    ) -> Result<PrivateForwardedDetailedRecap, DetailedRecapGenerationError> {
+        let recap_inputs = build_private_forwarded_recap_prompt(histories);
+        let raw = self.summarize_detailed_inputs(&recap_inputs).await?;
+        let empty_mapping = HashMap::new();
+        let summaries = raw
+            .summaries
+            .into_iter()
+            .filter_map(|summary| {
+                let sanitized = sanitize_detailed_recap_markdown(&summary);
+                let resolved =
+                    resolve_rich_recap_references(&sanitized, 0, "private", &empty_mapping);
+                let resolved = resolved.trim().to_owned();
+                (!resolved.is_empty()).then_some(resolved)
+            })
+            .collect::<Vec<_>>();
+        let recap_outputs = summaries.join("\n");
+
+        recap_logs::create_private_forwarded_recap(
+            &self.database,
+            user_id,
+            &recap_inputs,
+            &recap_outputs,
+            raw.usage,
+        )
+        .await
+        .map_err(|source| DetailedRecapGenerationError {
+            source,
+            usage: raw.usage,
+            trace: raw.trace.clone(),
+        })?;
+
+        Ok(PrivateForwardedDetailedRecap {
+            recap_inputs,
+            summaries,
+            usage: raw.usage,
+            trace: raw.trace,
+        })
+    }
+
+    async fn summarize_detailed_inputs(
+        &self,
+        recap_inputs: &str,
+    ) -> Result<RawDetailedRecap, DetailedRecapGenerationError> {
         let slices = self
             .openai
-            .split_content_by_token_limit(&recap_inputs, self.token_budget)
+            .split_content_by_token_limit(recap_inputs, self.token_budget)
             .map_err(|source| DetailedRecapGenerationError {
                 source,
                 usage: zero_usage(),
@@ -214,39 +293,33 @@ impl RecapGenerationService {
             }
         }
 
-        let resolved_summaries = raw_summaries
-            .into_iter()
-            .filter_map(|summary| {
-                let sanitized = sanitize_detailed_recap_markdown(&summary);
-                let resolved =
-                    resolve_rich_recap_references(&sanitized, chat_id, chat_type, &virtual_to_real);
-                let resolved = resolved.trim().to_owned();
-                (!resolved.is_empty()).then_some(resolved)
-            })
-            .collect::<Vec<_>>();
-
-        persist_group_detailed_recap(
-            &self.database,
-            chat_id,
-            &recap_inputs,
-            resolved_summaries,
-            total_usage,
-            aggregated_trace.clone(),
-            &self.configured_model,
-        )
-        .await
-        .map_err(|source| DetailedRecapGenerationError {
-            source,
+        Ok(RawDetailedRecap {
+            summaries: raw_summaries,
             usage: total_usage,
             trace: aggregated_trace,
         })
     }
 }
 
+struct RawDetailedRecap {
+    summaries: Vec<String>,
+    usage: TokenUsage,
+    trace: RecapExecutionTrace,
+}
+
 /// The detailed group recap after Go's mandatory recap-log write succeeds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupDetailedRecap {
     pub log_id: String,
+    pub recap_inputs: String,
+    pub summaries: Vec<String>,
+    pub usage: TokenUsage,
+    pub trace: RecapExecutionTrace,
+}
+
+/// The private-forwarded detailed recap after its mandatory log write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateForwardedDetailedRecap {
     pub recap_inputs: String,
     pub summaries: Vec<String>,
     pub usage: TokenUsage,
@@ -289,6 +362,28 @@ pub fn build_rich_recap_prompt(histories: &[TelegramChatHistory]) -> (String, Ha
     }
 
     (lines.join("\n"), virtual_to_real)
+}
+
+/// Build Go's private-forwarded prompt with Telegram's real message IDs.
+#[must_use]
+pub fn build_private_forwarded_recap_prompt(
+    histories: &[PrivateForwardedReplayChatHistory],
+) -> String {
+    histories
+        .iter()
+        .map(|history| {
+            format!(
+                "msgId:{}: {} sent: {}",
+                history.message_id,
+                format_full_name_and_username(
+                    &history.actor_display_name,
+                    &history.actor_username,
+                ),
+                history.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Build Go's condensed-generator transcript while retaining source indices.

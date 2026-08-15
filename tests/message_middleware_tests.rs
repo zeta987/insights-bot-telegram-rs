@@ -486,6 +486,49 @@ async fn an_active_session_appends_gos_exact_compact_payload_and_score() {
 }
 
 #[tokio::test]
+async fn a_private_payload_uses_go_html_safe_json_escaping() {
+    let store = RecordingRecapStateStore::new();
+    store
+        .start_forwarded(SENDER_USER_ID)
+        .await
+        .expect("the session must open");
+
+    capture_private(
+        &store,
+        &private_message("<&>\u{2028}\u{2029}"),
+        Some(SENDER_USER_ID),
+    )
+    .await;
+
+    let payload = store.appends().first().expect("one append").2.clone();
+    assert!(payload.contains(r#""text":"\u003c\u0026\u003e\u2028\u2029""#));
+    assert!(!payload.contains('<'));
+    assert!(!payload.contains('>'));
+    assert!(!payload.contains('&'));
+    assert!(!payload.contains('\u{2028}'));
+    assert!(!payload.contains('\u{2029}'));
+}
+
+#[tokio::test]
+async fn an_active_session_captures_the_generate_command_before_dispatch() {
+    let store = RecordingRecapStateStore::new();
+    store
+        .start_forwarded(SENDER_USER_ID)
+        .await
+        .expect("the session must open");
+
+    capture_private(
+        &store,
+        &private_message("/recap_forwarded"),
+        Some(SENDER_USER_ID),
+    )
+    .await;
+
+    let payload = store.appends().first().expect("one append").2.clone();
+    assert!(payload.contains(r#""text":"/recap_forwarded""#));
+}
+
+#[tokio::test]
 async fn a_forward_from_user_replaces_the_actor() {
     let store = RecordingRecapStateStore::new();
     store

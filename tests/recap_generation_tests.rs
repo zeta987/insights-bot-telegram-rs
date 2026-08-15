@@ -5,12 +5,13 @@ use insights_bot_telegram_rs::{
     config::{CondensedPromptConfig, OpenAiConfig as OpenAiSettings, RecapOpenAiConfig},
     db::models::{TelegramChatHistory, TokenUsage},
     services::{
+        message_capture::PrivateForwardedReplayChatHistory,
         openai::{OpenAiClient, TokenUsageRecorder},
         rate_limit::GoRateLimiter,
         recap_generation::{
             DatabaseTokenUsageRecorder, RecapGenerationService, build_condensed_history,
-            build_rich_recap_prompt, merge_recap_execution_trace, persist_group_detailed_recap,
-            resolved_group_model_name,
+            build_private_forwarded_recap_prompt, build_rich_recap_prompt,
+            merge_recap_execution_trace, persist_group_detailed_recap, resolved_group_model_name,
         },
         rich_recap::{GenerationModelExecutionTrace, RecapExecutionTrace},
     },
@@ -138,6 +139,114 @@ fn condensed_history_skips_empty_text_without_renumbering_following_rows() {
         build_condensed_history(&[empty, username_fallback, unknown]),
         "[2] bob: hi\n[3] 未知用戶: yo\n"
     );
+}
+
+fn forwarded_history(
+    message_id: i64,
+    actor_display_name: &str,
+    actor_username: &str,
+    text: &str,
+) -> PrivateForwardedReplayChatHistory {
+    PrivateForwardedReplayChatHistory {
+        chat_id: 42,
+        chat_type: "private".to_owned(),
+        chat_title: "Ada".to_owned(),
+        message_id,
+        actor_id: 0,
+        actor_username: actor_username.to_owned(),
+        actor_display_name: actor_display_name.to_owned(),
+        text: text.to_owned(),
+        chatted_at: 1_700_000_000_000 + message_id,
+    }
+}
+
+#[test]
+fn private_forwarded_prompt_uses_real_message_ids_and_go_name_selection() {
+    let histories = [
+        forwarded_history(91, "一二三四五六七八九十", "long_name", "first"),
+        forwarded_history(17, "A#B##", "ignored", "second"),
+        forwarded_history(105, "", "orphan_username", "third"),
+    ];
+
+    assert_eq!(
+        build_private_forwarded_recap_prompt(&histories),
+        "msgId:91: long_name sent: first\n\
+         msgId:17: AB sent: second\n\
+         msgId:105:  sent: third"
+    );
+}
+
+#[tokio::test]
+async fn private_forwarded_generation_removes_references_and_persists_go_log_shape() -> Result<()> {
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let server = MockServer::start().await;
+    let recap = recap_settings();
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({ "model": "recap-primary" })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-private-forwarded",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "resolved-forwarded-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<b>Forwarded</b> {{tg-ref:91}}"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens": 3,
+                "total_tokens": 11
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let service =
+        RecapGenerationService::new(database.clone(), openai_client(&server, &recap), &recap)?;
+    let histories = [forwarded_history(91, "Ada", "ada", "hello")];
+
+    let generated = service
+        .summarize_private_forwarded_histories(42, &histories)
+        .await?;
+
+    assert_eq!(generated.recap_inputs, "msgId:91: Ada sent: hello");
+    assert_eq!(generated.summaries, ["Forwarded"]);
+    assert_eq!(
+        generated.usage,
+        TokenUsage {
+            prompt_tokens: 8,
+            completion_tokens: 3,
+            total_tokens: 11,
+        }
+    );
+    assert_eq!(
+        generated.trace.generation.primary_used_model,
+        "resolved-forwarded-model"
+    );
+
+    let row = sqlx::query(
+        "SELECT chat_id, recap_inputs, recap_outputs, recap_type, model_name, \
+         prompt_token_usage, completion_token_usage, total_token_usage \
+         FROM log_chat_histories_recaps",
+    )
+    .fetch_one(&database.pool)
+    .await?;
+    assert_eq!(row.try_get::<i64, _>(0)?, 42);
+    assert_eq!(row.try_get::<String, _>(1)?, generated.recap_inputs);
+    assert_eq!(row.try_get::<String, _>(2)?, "Forwarded");
+    assert_eq!(row.try_get::<i64, _>(3)?, 1);
+    assert_eq!(row.try_get::<String, _>(4)?, "");
+    assert_eq!(row.try_get::<i64, _>(5)?, 8);
+    assert_eq!(row.try_get::<i64, _>(6)?, 3);
+    assert_eq!(row.try_get::<i64, _>(7)?, 11);
+
+    Ok(())
 }
 
 #[test]
