@@ -9,7 +9,7 @@ use teloxide::{
     prelude::{Bot, Requester, ResponseResult},
     types::{
         CallbackQuery, ChatMemberStatus, InlineKeyboardButton, InlineKeyboardMarkup, Me, Message,
-        ParseMode, ReplyParameters,
+        ParseMode, ReplyParameters, User,
     },
 };
 use tracing::error;
@@ -32,9 +32,16 @@ const ACTOR_ADMIN_REQUIRED: &str =
     "抱歉，此操作无法进行，需要<b>管理员</b>权限才能配置聊天记录回顾功能。";
 const CONFIGURE_UNAVAILABLE: &str = "暂时无法配置聊天记录回顾功能，请稍后再试！";
 const APPLY_CONFIG_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾功能的配置时出现了问题，请稍后再试！";
-const CREATOR_MODE_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，只有群组创建者才可以配置聊天记录回顾模式。";
-const CREATOR_RATE_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，只有群组创建者才可以配置每天自动创建聊天回顾的频率次数。";
+const CALLBACK_BOT_ADMIN_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，现在机器人不是<b>群组管理员</b>，已经不会记录任何聊天记录了。如果需要配置聊天记录回顾功能，<b>请先将机器人设为群组管理员</b>，然后再次执行命令后再试";
+const CREATOR_MODE_REQUIRED: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，抱歉，此操作无法进行，只有<b>群组创建者</b>角色可以配置聊天记录回顾的模式。";
 const APPLY_PIN_ERROR: &str = "好的。请在下面点击你想配置的选项进行操作吧。\n\n应用聊天记录回顾消息置顶功能的配置时出现了问题，请稍后再试！";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreatorOnlyPermission {
+    Allowed,
+    SilentDeny,
+    VisibleDeny,
+}
 
 fn display_rate(rates_per_day: i64) -> i64 {
     if rates_per_day == 0 { 4 } else { rates_per_day }
@@ -230,6 +237,29 @@ fn callback_origin_is_anonymous(callback: &CallbackQuery) -> bool {
         .is_some_and(is_group_anonymous_bot)
 }
 
+async fn check_creator_only_permission(
+    bot: &Bot,
+    message: &Message,
+    actor: &User,
+) -> ResponseResult<CreatorOnlyPermission> {
+    let creator_check = bot.get_chat_member(message.chat.id, actor.id).await?;
+    if creator_check.status() == ChatMemberStatus::Owner {
+        return Ok(CreatorOnlyPermission::Allowed);
+    }
+
+    // Pinned Go calls IsUserMemberStatus twice, issuing a second Telegram
+    // lookup after the creator check even though both requests return the same
+    // membership object in ordinary Bot API deployments.
+    let administrator_check = bot.get_chat_member(message.chat.id, actor.id).await?;
+    if administrator_check.status() == ChatMemberStatus::Administrator
+        || is_group_anonymous_bot(actor)
+    {
+        Ok(CreatorOnlyPermission::VisibleDeny)
+    } else {
+        Ok(CreatorOnlyPermission::SilentDeny)
+    }
+}
+
 async fn edit_configuration(
     bot: &Bot,
     callback: &CallbackQuery,
@@ -288,7 +318,7 @@ pub async fn handle_toggle_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
     let actor_is_admin = if is_group_anonymous_bot(&callback.from) {
         true
@@ -305,7 +335,7 @@ pub async fn handle_toggle_callback(
         }
     };
     if !actor_is_admin {
-        return edit_configuration(&bot, &callback, ACTOR_ADMIN_REQUIRED, None).await;
+        return Ok(());
     }
 
     let chat_type = if message.chat.is_group() {
@@ -414,17 +444,22 @@ pub async fn handle_assign_mode_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
-    let actor_is_owner = match bot.get_chat_member(message.chat.id, callback.from.id).await {
-        Ok(member) => member.status() == ChatMemberStatus::Owner,
+    let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
+    {
+        Ok(permission) => permission,
         Err(error) => {
             error!(?error, "failed to check recap mode actor permission");
             return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
         }
     };
-    if !actor_is_owner {
-        return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+    match actor_permission {
+        CreatorOnlyPermission::Allowed => {}
+        CreatorOnlyPermission::SilentDeny => return Ok(()),
+        CreatorOnlyPermission::VisibleDeny => {
+            return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+        }
     }
     let Some(mode) = AutoRecapSendMode::from_stored(data.mode) else {
         return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
@@ -524,17 +559,22 @@ pub async fn handle_rates_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
-    let actor_is_owner = match bot.get_chat_member(message.chat.id, callback.from.id).await {
-        Ok(member) => member.status() == ChatMemberStatus::Owner,
+    let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
+    {
+        Ok(permission) => permission,
         Err(error) => {
             error!(?error, "failed to check recap rate actor permission");
             return edit_configuration(&bot, &callback, APPLY_CONFIG_ERROR, None).await;
         }
     };
-    if !actor_is_owner {
-        return edit_configuration(&bot, &callback, CREATOR_RATE_REQUIRED, None).await;
+    match actor_permission {
+        CreatorOnlyPermission::Allowed => {}
+        CreatorOnlyPermission::SilentDeny => return Ok(()),
+        CreatorOnlyPermission::VisibleDeny => {
+            return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+        }
     }
     if let Err(error) =
         recap_options::set_rates_per_day(&context.db, data.chat_id, data.rates).await
@@ -635,17 +675,22 @@ pub async fn handle_pin_callback(
         }
     };
     if !bot_is_admin {
-        return edit_configuration(&bot, &callback, BOT_ADMIN_REQUIRED, None).await;
+        return edit_configuration(&bot, &callback, CALLBACK_BOT_ADMIN_REQUIRED, None).await;
     }
-    let actor_is_owner = match bot.get_chat_member(message.chat.id, callback.from.id).await {
-        Ok(member) => member.status() == ChatMemberStatus::Owner,
+    let actor_permission = match check_creator_only_permission(&bot, message, &callback.from).await
+    {
+        Ok(permission) => permission,
         Err(error) => {
             error!(?error, "failed to check recap pin actor permission");
             return edit_configuration(&bot, &callback, APPLY_PIN_ERROR, None).await;
         }
     };
-    if !actor_is_owner {
-        return Ok(());
+    match actor_permission {
+        CreatorOnlyPermission::Allowed => {}
+        CreatorOnlyPermission::SilentDeny => return Ok(()),
+        CreatorOnlyPermission::VisibleDeny => {
+            return edit_configuration(&bot, &callback, CREATOR_MODE_REQUIRED, None).await;
+        }
     }
     let chat_id = message.chat.id.0;
     let options = match recap_options::find_one(&context.db, chat_id).await {

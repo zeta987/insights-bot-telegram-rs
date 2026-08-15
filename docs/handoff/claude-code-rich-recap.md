@@ -44,7 +44,7 @@ of `/configure_recap`:
 - `src/bot/handlers/mod.rs` exports the new module.
 - The focused keyboard test passed before the checkpoint was committed.
 
-The current checkpoint completes the production `/configure_recap` runtime:
+Signed commit `27c2ea7` completes the production `/configure_recap` runtime:
 
 - The command checks bot-admin status first, then creator/administrator or the
   exact Group Anonymous Bot, replies to the command, and keeps missing options
@@ -62,8 +62,22 @@ The current checkpoint completes the production `/configure_recap` runtime:
 - The legacy production `cfg:*` dispatcher and keyboard were removed. The old
   Rust-only `db::recap_config` module remains for existing schema compatibility
   and tests but has no production callsite.
-- `tests/recap_configure_tests.rs` now has seven passing command, keyboard,
+- `tests/recap_configure_tests.rs` has seven command, keyboard,
   callback, persistence, queue, deletion, and pin-quirk tests.
+
+The checkpoint after `27c2ea7` ports Go's callback permission branching that a
+success-only audit originally missed:
+
+- An ordinary member's toggle, mode, rate, and pin mutations are silently
+  ignored without editing the configuration message.
+- Mode, rate, and pin perform separate creator and administrator Telegram
+  membership lookups, matching Go's two `IsUserMemberStatus` calls.
+- Administrators and the Group Anonymous Bot receive Go's same creator-only
+  mode error for all three operations, including the duplicated
+  `抱歉，此操作无法进行` text. Bot-admin denial edits now include the configuration
+  header exactly as Go does.
+- Two RED-to-GREEN transport tests raise the focused configuration total to
+  nine.
 
 The current automatic-recap checkpoint adds:
 
@@ -93,17 +107,18 @@ Latest verification before this handoff:
 
 - `cargo clippy --all-targets --all-features -- -D warnings` passed.
 - Full `cargo test` passed.
-- `/configure_recap` focused tests passed: 7.
+- `/configure_recap` focused tests passed: 9.
 - Automatic-recap focused tests passed: worker 9, queue 11, delivery 8.
 
 ## Next required slice
 
-Start with a read-only pinned-Go versus Rust audit of the completed automatic
-worker and configuration runtime; do not assume the passing tests prove every
-error branch. Prioritize exact callback denial/error behavior, anonymous-origin
-exceptions, toggle-off queue retention, rate rescore while disabled, expired
-callback payloads, startup queue seeding, and production worker invocation.
-Add one RED test for each confirmed behavioral difference before modifying code.
+Continue the read-only pinned-Go versus Rust audit of the completed automatic
+worker and configuration runtime; passing tests do not prove every error branch.
+The ordinary-member and creator-only callback branches are complete. Next check
+anonymous-origin exceptions, toggle-off queue retention, rate rescore while
+disabled, expired callback payloads, startup queue seeding, production worker
+invocation, and the callback group-only and Bot API failure branches. Add one
+RED test for each confirmed behavioral difference before modifying code.
 
 When that audit is clean, use `docs/parity/go-v1.0.0-rich-recap-ledger.md` and a
 fresh structural callsite inventory to select the next non-`/smr` Telegram gap.

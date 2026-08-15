@@ -96,6 +96,20 @@ fn telegram_administrator_result(user_id: i64, is_bot: bool) -> Value {
     })
 }
 
+fn telegram_member_result(user_id: i64) -> Value {
+    serde_json::json!({
+        "ok": true,
+        "result": {
+            "user": {
+                "id": user_id,
+                "is_bot": false,
+                "first_name": "Ada"
+            },
+            "status": "member"
+        }
+    })
+}
+
 fn telegram_owner_result() -> Value {
     serde_json::json!({
         "ok": true,
@@ -895,4 +909,170 @@ async fn complete_checks_only_actor_then_best_effort_deletes_settings_and_comman
     );
     assert_eq!(request_body(&requests[1])["message_id"], 88);
     assert_eq!(request_body(&requests[2])["message_id"], 77);
+}
+
+#[tokio::test]
+async fn ordinary_members_are_silently_ignored_by_every_config_mutation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_member_result(FROM_ID)))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("enabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wires = [
+        &keyboard["inline_keyboard"][1][0]["callback_data"],
+        &keyboard["inline_keyboard"][3][1]["callback_data"],
+        &keyboard["inline_keyboard"][5][0]["callback_data"],
+        &keyboard["inline_keyboard"][7][0]["callback_data"],
+    ];
+    let context = command_context(&server, database, state).await;
+
+    for wire in wires {
+        RecapHandlers::handle_callback_query_with_me(
+            context.config.telegram.bot(),
+            configure_callback(wire.as_str().expect("callback wire")),
+            bot_me(),
+            context.clone(),
+        )
+        .await
+        .expect("ordinary member callback is silently ignored");
+    }
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/EditMessageText"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.url.path().ends_with("/GetChatMember")
+                    && request_body(request)["user_id"] == FROM_ID
+            })
+            .count(),
+        7,
+        "Go checks creator and then administrator separately for mode, rate, and pin"
+    );
+}
+
+#[tokio::test]
+async fn administrators_receive_go_creator_only_error_for_mode_rate_and_pin() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": 9_999})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(9_999, true)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .and(body_partial_json(serde_json::json!({"user_id": FROM_ID})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(telegram_administrator_result(FROM_ID, false)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/EditMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_message_result()))
+        .mount(&server)
+        .await;
+
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let keyboard = build_configure_keyboard(
+        state.as_ref(),
+        ConfigureRecapView {
+            chat_id: CHAT_ID,
+            from_id: FROM_ID,
+            recap_enabled: true,
+            send_mode: 0,
+            rates_per_day: 4,
+            pin_enabled: false,
+        },
+    )
+    .await
+    .expect("enabled configure keyboard");
+    let keyboard = serde_json::to_value(keyboard).expect("serialize configure keyboard");
+    let wires = [
+        &keyboard["inline_keyboard"][3][1]["callback_data"],
+        &keyboard["inline_keyboard"][5][0]["callback_data"],
+        &keyboard["inline_keyboard"][7][0]["callback_data"],
+    ];
+    let context = command_context(&server, database, state).await;
+
+    for wire in wires {
+        RecapHandlers::handle_callback_query_with_me(
+            context.config.telegram.bot(),
+            configure_callback(wire.as_str().expect("callback wire")),
+            bot_me(),
+            context.clone(),
+        )
+        .await
+        .expect("administrator receives creator-only edit");
+    }
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let actor_checks = requests
+        .iter()
+        .filter(|request| {
+            request.url.path().ends_with("/GetChatMember")
+                && request_body(request)["user_id"] == FROM_ID
+        })
+        .count();
+    assert_eq!(actor_checks, 6);
+    let edits = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/EditMessageText"))
+        .collect::<Vec<_>>();
+    assert_eq!(edits.len(), 3);
+    for edit in edits {
+        assert_eq!(
+            request_body(edit)["text"],
+            "好的。请在下面点击你想配置的选项进行操作吧。\n\n抱歉，此操作无法进行，抱歉，此操作无法进行，只有<b>群组创建者</b>角色可以配置聊天记录回顾的模式。"
+        );
+    }
 }
