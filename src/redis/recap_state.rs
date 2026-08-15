@@ -141,6 +141,21 @@ pub trait RecapStateStore: Send + Sync {
             delete_error: None,
         })
     }
+
+    /// Add or rescore one deterministic automatic-recap queue member.
+    async fn auto_recap_zadd(&self, _member: &str, _score_ms: i64) -> Result<()> {
+        Err(anyhow!("automatic recap queue is unavailable"))
+    }
+
+    /// Run the timecapsule/v2 due-check and functional minimum-pop sequence.
+    async fn auto_recap_zpop_due(&self, _now_ms: i64) -> Result<Option<String>> {
+        Err(anyhow!("automatic recap queue is unavailable"))
+    }
+
+    /// Remove a queue member. This is intentionally safe after a successful pop.
+    async fn auto_recap_zrem(&self, _member: &str) -> Result<()> {
+        Err(anyhow!("automatic recap queue is unavailable"))
+    }
 }
 
 /// Result of Go's manual-recap command rate check.
@@ -630,6 +645,62 @@ impl RecapStateStore for InMemoryRecapStateStore {
             .filter_map(|raw| keys::parse_delete_later_member(raw))
             .collect())
     }
+
+    async fn auto_recap_zadd(&self, member: &str, score_ms: i64) -> Result<()> {
+        let (_, mut guard) = self.locked();
+        let entry = guard
+            .entry(keys::AUTO_RECAP_QUEUE_KEY.to_owned())
+            .or_insert_with(|| Entry {
+                value: Value::ZSet(HashMap::new()),
+                expires_at_ms: i64::MAX,
+            });
+        let Value::ZSet(members) = &mut entry.value else {
+            return Err(anyhow!("recap Redis ZADD failed (TypeError)"));
+        };
+        members.insert(member.to_owned(), score_ms);
+        entry.expires_at_ms = i64::MAX;
+        Ok(())
+    }
+
+    async fn auto_recap_zpop_due(&self, now_ms: i64) -> Result<Option<String>> {
+        let (_, mut guard) = self.locked();
+        let Some(Entry {
+            value: Value::ZSet(members),
+            ..
+        }) = guard.get_mut(keys::AUTO_RECAP_QUEUE_KEY)
+        else {
+            return Ok(None);
+        };
+
+        if !members.values().any(|score| (0..=now_ms).contains(score)) {
+            return Ok(None);
+        }
+        let Some((member, score)) = members
+            .iter()
+            .map(|(member, score)| (member.clone(), *score))
+            .min_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)))
+        else {
+            return Ok(None);
+        };
+        members.remove(&member);
+        if score > now_ms {
+            members.insert(member, score);
+            return Ok(None);
+        }
+        Ok(Some(member))
+    }
+
+    async fn auto_recap_zrem(&self, member: &str) -> Result<()> {
+        let (_, mut guard) = self.locked();
+        if let Some(Entry {
+            value: Value::ZSet(members),
+            ..
+        }) = guard.get_mut(keys::AUTO_RECAP_QUEUE_KEY)
+        {
+            members.remove(member);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -977,5 +1048,67 @@ impl RecapStateStore for RedisRecapStateStore {
 
     async fn drain_delete_later_for_delivery(&self, user_id: i64) -> Result<DeleteLaterDrain> {
         self.drain_delete_later_status(user_id).await
+    }
+
+    async fn auto_recap_zadd(&self, member: &str, score_ms: i64) -> Result<()> {
+        let mut connection = self.connection();
+        let _: i64 = ::redis::cmd("ZADD")
+            .arg(keys::AUTO_RECAP_QUEUE_KEY)
+            .arg(score_ms)
+            .arg(member)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("ZADD", &error))?;
+        Ok(())
+    }
+
+    async fn auto_recap_zpop_due(&self, now_ms: i64) -> Result<Option<String>> {
+        let mut connection = self.connection();
+        let due: Vec<String> = ::redis::cmd("ZRANGEBYSCORE")
+            .arg(keys::AUTO_RECAP_QUEUE_KEY)
+            .arg(0_i64)
+            .arg(now_ms)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("ZRANGEBYSCORE", &error))?;
+        if due.is_empty() {
+            return Ok(None);
+        }
+
+        let popped: Vec<(String, f64)> = ::redis::cmd("ZPOPMIN")
+            .arg(keys::AUTO_RECAP_QUEUE_KEY)
+            .arg(1_i64)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("ZPOPMIN", &error))?;
+        let Some((member, score)) = popped.into_iter().next() else {
+            return Ok(None);
+        };
+        let score_ms = score as i64;
+        if score_ms > now_ms {
+            let mut last_error = None;
+            for attempt in 0..100 {
+                match self.auto_recap_zadd(&member, score_ms).await {
+                    Ok(()) => return Ok(None),
+                    Err(error) => last_error = Some(error),
+                }
+                if attempt < 99 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            return Err(last_error.expect("one hundred restore attempts record an error"));
+        }
+        Ok(Some(member))
+    }
+
+    async fn auto_recap_zrem(&self, member: &str) -> Result<()> {
+        let mut connection = self.connection();
+        let _: i64 = ::redis::cmd("ZREM")
+            .arg(keys::AUTO_RECAP_QUEUE_KEY)
+            .arg(member)
+            .query_async(&mut connection)
+            .await
+            .map_err(|error| redacted("ZREM", &error))?;
+        Ok(())
     }
 }

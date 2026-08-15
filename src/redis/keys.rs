@@ -35,6 +35,9 @@ const FORWARDED_KEY_PREFIX: &str = "recap/replay_from_private_message";
 const DELETE_LATER_KEY_PREFIX: &str = "session/delete_later_messages_for_actor";
 const MANUAL_RECAP_RATE_KEY_PREFIX: &str = "rate_limit/manual_recap/command:/recap/group/Telegram";
 
+/// No-TTL sorted set used by the automatic recap time-capsule digger.
+pub const AUTO_RECAP_QUEUE_KEY: &str = "time_capsule/auto_recap_capsules";
+
 pub const ROUTE_SELECT_HOUR: &str = "recap/select-hour";
 pub const ROUTE_CONFIGURE_TOGGLE: &str = "recap/configure/toggle";
 pub const ROUTE_CONFIGURE_ASSIGN_MODE: &str = "recap/configure/assign_mode";

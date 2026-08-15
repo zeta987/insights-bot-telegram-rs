@@ -1,351 +1,569 @@
-use std::{sync::Arc, time::Duration};
+//! Go v1.0.0 automatic Rich recap orchestration.
 
-use crate::db::models::RecapConfig;
-use chrono::Utc;
-use teloxide::prelude::*;
-use teloxide::types::MessageId;
-use tokio::time::interval;
+use std::{future::Future, sync::Arc, time::Duration};
+
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
+use teloxide::{prelude::*, types::ChatFullInfo};
+use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
-use crate::bot::handlers::recap::build_recap_nodes;
-use crate::{bot::context::AppContext, db::chat_history, services::recap::RecapService};
+use crate::{
+    bot::{
+        context::AppContext,
+        handlers::{
+            recap_manual::build_vote_keyboard, recap_subscription::build_subscriber_vote_keyboard,
+        },
+    },
+    db::{
+        Database, chat_history, feature_flags,
+        feedback::{self, ReactionTable},
+        models::{
+            CHAT_TYPE_GROUP, CHAT_TYPE_SUPERGROUP, TelegramChatAutoRecapsSubscriber,
+            TelegramChatRecapsOptions,
+        },
+        recap_options, subscribers,
+    },
+    redis::recap_state::RecapStateStore,
+    services::{
+        autorecap_delivery::{AutoRecapDeliveryTarget, deliver_auto_recap_targets},
+        autorecap_queue::{
+            AUTO_RECAP_POLL_INTERVAL, auto_recap_window_hours, effective_auto_recap_rate,
+            enqueue_auto_recap, next_auto_recap_at_ms, pop_due_auto_recap,
+        },
+        rate_limit::GoRateLimiter,
+        recap_delivery::{BeforeSendHook, TelegramRecapSender},
+        recap_generation::RecapGenerationService,
+        rich_recap::{
+            RichRecapSummaryConfig, build_rich_recap_summary, compose_rich_recap_messages,
+            fallback_condensed_summary,
+        },
+    },
+};
 
-/// Schedule slots for each frequency (UTC hours).
-const SCHEDULE_2X: &[u32] = &[8, 20];
-const SCHEDULE_3X: &[u32] = &[0, 8, 16];
-const SCHEDULE_4X: &[u32] = &[2, 8, 14, 20];
+const STATE_READ_ATTEMPTS: usize = 10;
+const AUTO_RECAP_QUEUE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Message window in hours for each frequency.
-fn message_window_hours(rates_per_day: i32) -> i64 {
-    match rates_per_day {
-        2 => 12,
-        3 => 8,
-        _ => 6, // 4x default
+/// The three database reads a popped Go TimeCapsule performs before requeueing.
+#[async_trait]
+pub trait AutoRecapStateReader: Send + Sync {
+    async fn recap_enabled(&self, chat_id: i64) -> Result<bool>;
+
+    async fn recap_options(&self, chat_id: i64) -> Result<Option<TelegramChatRecapsOptions>>;
+
+    async fn recap_subscribers(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<TelegramChatAutoRecapsSubscriber>>;
+}
+
+#[async_trait]
+impl AutoRecapStateReader for Database {
+    async fn recap_enabled(&self, chat_id: i64) -> Result<bool> {
+        feature_flags::has_recap_enabled(self, chat_id, "").await
+    }
+
+    async fn recap_options(&self, chat_id: i64) -> Result<Option<TelegramChatRecapsOptions>> {
+        recap_options::find_one(self, chat_id).await
+    }
+
+    async fn recap_subscribers(
+        &self,
+        chat_id: i64,
+    ) -> Result<Vec<TelegramChatAutoRecapsSubscriber>> {
+        subscribers::list(self, chat_id).await
     }
 }
 
-/// Get the schedule slots for a given frequency.
-fn schedule_slots(rates_per_day: i32) -> &'static [u32] {
-    match rates_per_day {
-        2 => SCHEDULE_2X,
-        3 => SCHEDULE_3X,
-        _ => SCHEDULE_4X,
+/// Values retained after Go's three independent ten-attempt reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoRecapReadState {
+    pub enabled: bool,
+    pub options: Option<TelegramChatRecapsOptions>,
+    pub subscribers: Vec<TelegramChatAutoRecapsSubscriber>,
+    pub read_error_count: usize,
+}
+
+/// One delivery destination in Go's observable iteration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoRecapTarget {
+    pub chat_id: i64,
+    pub is_private_subscriber: bool,
+}
+
+/// Decision made after state reads and the required next-slot queue writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoRecapPreparation {
+    Disabled,
+    PrivateWithoutSubscribers {
+        options: TelegramChatRecapsOptions,
+    },
+    Generate {
+        options: TelegramChatRecapsOptions,
+        subscribers: Vec<TelegramChatAutoRecapsSubscriber>,
+    },
+}
+
+/// Retry feature, option and subscriber reads independently, without delay.
+pub async fn read_auto_recap_state<R>(reader: &R, chat_id: i64) -> AutoRecapReadState
+where
+    R: AutoRecapStateReader + ?Sized,
+{
+    let (enabled, enabled_failed) =
+        retry_state_read("feature enablement", || reader.recap_enabled(chat_id)).await;
+    let (options, options_failed) =
+        retry_state_read("recap options", || reader.recap_options(chat_id)).await;
+    let (subscribers, subscribers_failed) =
+        retry_state_read("recap subscribers", || reader.recap_subscribers(chat_id)).await;
+
+    AutoRecapReadState {
+        enabled: enabled.unwrap_or(false),
+        options: options.flatten(),
+        subscribers: subscribers.unwrap_or_default(),
+        read_error_count: [enabled_failed, options_failed, subscribers_failed]
+            .into_iter()
+            .filter(|failed| *failed)
+            .count(),
     }
 }
 
-/// Check if a config is due for recap based on schedule slots.
-/// Returns true if the current UTC hour matches a slot AND last_recap_at
-/// is before the current slot's start time.
-fn is_due_for_recap(cfg: &RecapConfig, now: i64) -> bool {
-    let current_hour = ((now % 86400) / 3600) as u32;
-    let slots = schedule_slots(cfg.auto_recap_rates_per_day);
+async fn retry_state_read<T, F, Fut>(label: &'static str, mut read: F) -> (Option<T>, bool)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    for attempt in 1..=STATE_READ_ATTEMPTS {
+        match read().await {
+            Ok(value) => return (Some(value), false),
+            Err(source) => error!(
+                operation = label,
+                attempt,
+                error = %source,
+                "automatic recap state read failed"
+            ),
+        }
+    }
+    (None, true)
+}
 
-    // Find if current hour is within ±30 minutes of any slot
-    let matching_slot = slots.iter().find(|&&slot_hour| {
-        // Allow a 59-minute window: exact hour match only
-        // (the 60s ticker ensures we check each hour)
-        current_hour == slot_hour
-    });
+/// Public-group delivery comes first; subscriber rows keep DB order and duplicates.
+#[must_use]
+pub fn build_auto_recap_targets(
+    source_chat_id: i64,
+    send_mode: i64,
+    subscriber_ids: &[i64],
+) -> Vec<AutoRecapTarget> {
+    let mut targets = Vec::with_capacity(subscriber_ids.len() + usize::from(send_mode == 0));
+    if send_mode == 0 {
+        targets.push(AutoRecapTarget {
+            chat_id: source_chat_id,
+            is_private_subscriber: false,
+        });
+    }
+    targets.extend(
+        subscriber_ids
+            .iter()
+            .copied()
+            .map(|chat_id| AutoRecapTarget {
+                chat_id,
+                is_private_subscriber: true,
+            }),
+    );
+    targets
+}
 
-    let Some(&slot_hour) = matching_slot else {
-        return false;
+/// Go generates an automatic recap only when more than five rows were loaded.
+#[must_use]
+pub const fn has_enough_auto_recap_histories(history_count: usize) -> bool {
+    history_count > 5
+}
+
+/// Calculate and enqueue the next slot while swallowing the queue failure.
+///
+/// Go logs `BuryUtil` failures but returns nil to every caller, so the due time
+/// remains the only observable return value here.
+pub async fn queue_next_auto_recap(
+    state: &(impl RecapStateStore + ?Sized),
+    chat_id: i64,
+    rates_per_day: i64,
+    timezone_shift_seconds: i64,
+    now_utc_ms: i64,
+) -> i64 {
+    let configured_rate = i32::try_from(rates_per_day).unwrap_or(4);
+    let rate = effective_auto_recap_rate(configured_rate);
+    let due_ms = next_auto_recap_at_ms(now_utc_ms, timezone_shift_seconds, rate);
+    let queued = timeout(
+        AUTO_RECAP_QUEUE_TIMEOUT,
+        enqueue_auto_recap(state, chat_id, due_ms),
+    )
+    .await;
+    match queued {
+        Ok(Ok(_)) => info!(chat_id, due_ms, "automatic recap scheduled"),
+        Ok(Err(source)) => error!(
+            chat_id,
+            due_ms,
+            error = %source,
+            "failed to enqueue automatic recap"
+        ),
+        Err(_) => error!(
+            chat_id,
+            due_ms, "automatic recap enqueue timed out after sixty seconds"
+        ),
+    }
+    due_ms
+}
+
+/// Read state, reproduce Go's error requeue, then perform the normal requeue.
+pub async fn prepare_auto_recap<R>(
+    reader: &R,
+    state: &(impl RecapStateStore + ?Sized),
+    chat_id: i64,
+    timezone_shift_seconds: i64,
+    now_utc_ms: i64,
+) -> Result<AutoRecapPreparation>
+where
+    R: AutoRecapStateReader + ?Sized,
+{
+    let mut read = read_auto_recap_state(reader, chat_id).await;
+
+    if read.read_error_count > 0 {
+        let options = read.options.as_mut().ok_or_else(|| {
+            anyhow!("automatic recap state reads were exhausted and no usable options remained")
+        })?;
+        normalize_options_rate(options);
+        queue_next_auto_recap(
+            state,
+            chat_id,
+            options.auto_recap_rates_per_day,
+            timezone_shift_seconds,
+            now_utc_ms,
+        )
+        .await;
+    }
+
+    if !read.enabled {
+        return Ok(AutoRecapPreparation::Disabled);
+    }
+
+    let mut options = read
+        .options
+        .ok_or_else(|| anyhow!("automatic recap is enabled but its options row is unavailable"))?;
+    normalize_options_rate(&mut options);
+    queue_next_auto_recap(
+        state,
+        chat_id,
+        options.auto_recap_rates_per_day,
+        timezone_shift_seconds,
+        now_utc_ms,
+    )
+    .await;
+
+    if options.auto_recap_send_mode == 1 && read.subscribers.is_empty() {
+        return Ok(AutoRecapPreparation::PrivateWithoutSubscribers { options });
+    }
+
+    Ok(AutoRecapPreparation::Generate {
+        options,
+        subscribers: read.subscribers,
+    })
+}
+
+fn normalize_options_rate(options: &mut TelegramChatRecapsOptions) {
+    let configured = i32::try_from(options.auto_recap_rates_per_day).unwrap_or(4);
+    options.auto_recap_rates_per_day = i64::from(effective_auto_recap_rate(configured));
+}
+
+/// Start the one-second TimeCapsule digger after seeding enabled chats.
+pub async fn spawn_autorecap(ctx: Arc<AppContext>) {
+    let Some(state) = ctx.recap_state.clone() else {
+        warn!("automatic recap Redis state store is unavailable");
+        return;
     };
 
-    // Calculate the start timestamp of this slot today
-    let today_start = now - (now % 86400); // midnight UTC today
-    let slot_start = today_start + (slot_hour as i64 * 3600);
+    queue_all_enabled_chats(&ctx, state.as_ref()).await;
 
-    // Due if never recapped or last recap was before this slot started
-    match cfg.last_recap_at {
-        None => true,
-        Some(last) => last < slot_start,
+    if ctx.config.auto_recap_test.enabled && ctx.config.auto_recap_test.chat_id != 0 {
+        let test_ctx = ctx.clone();
+        let test_state = state.clone();
+        let test_chat_id = ctx.config.auto_recap_test.chat_id;
+        tokio::spawn(async move {
+            if let Err(source) = handle_auto_recap_capsule(test_ctx, test_state, test_chat_id).await
+            {
+                error!(
+                    chat_id = test_chat_id,
+                    error = %source,
+                    "automatic recap test capsule failed"
+                );
+            }
+        });
     }
-}
 
-pub async fn spawn_autorecap(ctx: Arc<AppContext>) {
     tokio::spawn(async move {
-        let mut ticker = interval(Duration::from_secs(60));
+        let first_tick = Instant::now() + AUTO_RECAP_POLL_INTERVAL;
+        let mut ticker = interval_at(first_tick, AUTO_RECAP_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if let Err(err) = run_once(ctx.clone()).await {
-                error!("auto_recap tick failed: {err:?}");
+            let now_ms = Utc::now().timestamp_millis();
+            match pop_due_auto_recap(state.as_ref(), now_ms).await {
+                Ok(Some(capsule)) => {
+                    if let Err(source) =
+                        handle_auto_recap_capsule(ctx.clone(), state.clone(), capsule.chat_id).await
+                    {
+                        error!(
+                            chat_id = capsule.chat_id,
+                            error = %source,
+                            "automatic recap capsule failed"
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(source) => error!(error = %source, "automatic recap queue poll failed"),
             }
         }
     });
 }
 
-async fn run_once(ctx: Arc<AppContext>) -> anyhow::Result<()> {
-    let now = Utc::now().timestamp();
-    let configs = crate::db::recap_config::list_auto_recap_enabled(&ctx.db.pool).await?;
-    if configs.is_empty() {
-        return Ok(());
-    }
+async fn queue_all_enabled_chats(ctx: &AppContext, state: &dyn RecapStateStore) {
+    let chats = match feature_flags::list_recap_enabled_groups(&ctx.db).await {
+        Ok(chats) => chats,
+        Err(source) => {
+            error!(error = %source, "failed to list enabled automatic recap chats");
+            return;
+        }
+    };
 
-    // Filter to only configs that are due based on schedule slots
-    let due_configs: Vec<_> = configs
-        .into_iter()
-        .filter(|c| is_due_for_recap(c, now))
-        .collect();
-    if due_configs.is_empty() {
-        return Ok(());
+    for chat in chats {
+        match recap_options::find_one_or_create(&ctx.db, chat.chat_id).await {
+            Ok(options) => {
+                queue_next_auto_recap(
+                    state,
+                    chat.chat_id,
+                    options.auto_recap_rates_per_day,
+                    ctx.config.timezone_shift_seconds,
+                    Utc::now().timestamp_millis(),
+                )
+                .await;
+            }
+            Err(source) => error!(
+                chat_id = chat.chat_id,
+                error = %source,
+                "failed to find or create automatic recap options"
+            ),
+        }
     }
+}
 
+async fn handle_auto_recap_capsule(
+    ctx: Arc<AppContext>,
+    state: Arc<dyn RecapStateStore>,
+    chat_id: i64,
+) -> Result<()> {
+    let preparation = prepare_auto_recap(
+        &ctx.db,
+        state.as_ref(),
+        chat_id,
+        ctx.config.timezone_shift_seconds,
+        Utc::now().timestamp_millis(),
+    )
+    .await?;
+
+    match preparation {
+        AutoRecapPreparation::Disabled => {
+            info!(chat_id, "automatic recap is disabled; capsule discarded");
+        }
+        AutoRecapPreparation::PrivateWithoutSubscribers { .. } => {
+            info!(
+                chat_id,
+                "private-only automatic recap has no subscribers; generation skipped"
+            );
+        }
+        AutoRecapPreparation::Generate {
+            options,
+            subscribers,
+        } => {
+            tokio::spawn(async move {
+                if let Err(source) =
+                    generate_and_deliver_auto_recap(ctx, state, chat_id, options, subscribers).await
+                {
+                    error!(
+                        chat_id,
+                        error = %source,
+                        "automatic recap generation failed"
+                    );
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+async fn generate_and_deliver_auto_recap(
+    ctx: Arc<AppContext>,
+    state: Arc<dyn RecapStateStore>,
+    chat_id: i64,
+    options: TelegramChatRecapsOptions,
+    subscribers: Vec<TelegramChatAutoRecapsSubscriber>,
+) -> Result<()> {
     let bot = ctx.config.telegram.bot();
-    let service = RecapService::new(&ctx.db, &ctx.openai);
+    let chat = bot.get_chat(ChatId(chat_id)).await?;
+    let chat_type = telegram_chat_type(&chat);
+    let hours =
+        auto_recap_window_hours(i32::try_from(options.auto_recap_rates_per_day).unwrap_or(4));
+    let histories =
+        chat_history::find_by_time_before(&ctx.db, chat_id, ChronoDuration::hours(hours)).await?;
+    if !has_enough_auto_recap_histories(histories.len()) {
+        warn!(
+            chat_id,
+            history_count = histories.len(),
+            "not enough chat histories"
+        );
+        return Ok(());
+    }
+    let chat_title = histories
+        .last()
+        .map(|history| history.chat_title.clone())
+        .unwrap_or_default();
 
-    for cfg in due_configs {
-        let hours = message_window_hours(cfg.auto_recap_rates_per_day);
+    let generation =
+        RecapGenerationService::new(ctx.db.clone(), ctx.openai.clone(), &ctx.config.recap_openai)?;
+    let detailed = generation
+        .summarize_group_histories(chat_id, chat_type, &histories)
+        .await?;
+    let log_id = Uuid::parse_str(&detailed.log_id)?;
+    let counts =
+        feedback::counts(&ctx.db, ReactionTable::ChatHistoriesRecaps, chat_id, log_id).await?;
+    let public_keyboard =
+        build_vote_keyboard(state.as_ref(), chat_id, &detailed.log_id, counts).await?;
+    if detailed.summaries.is_empty() {
+        warn!(chat_id, "automatic recap detailed summaries are empty");
+        return Ok(());
+    }
 
-        // Fetch messages using the time-based window instead of a fixed limit
-        let messages =
-            match chat_history::messages_since_hours(&ctx.db.pool, cfg.chat_id, hours).await {
-                Ok(msgs) => msgs,
-                Err(err) => {
-                    warn!(
-                        "auto_recap fetch messages for chat {} failed: {err:?}",
-                        cfg.chat_id
+    let (condensed_summary, condensed_trace) =
+        match generation.generate_condensed(chat_id, &histories).await {
+            Ok(result) if !result.content.trim().is_empty() => {
+                (result.content.trim().to_owned(), result.trace)
+            }
+            Ok(result) => (
+                fallback_condensed_summary(
+                    &detailed.summaries,
+                    &format!("過去 {hours} 小時的群組聊天回顧"),
+                ),
+                result.trace,
+            ),
+            Err(source) => {
+                warn!(
+                    chat_id,
+                    error = %source,
+                    "using automatic recap condensed fallback"
+                );
+                (
+                    fallback_condensed_summary(
+                        &detailed.summaries,
+                        &format!("過去 {hours} 小時的群組聊天回顧"),
+                    ),
+                    source.trace,
+                )
+            }
+        };
+
+    let build_parts = |subscription_chat_title: &str| {
+        let visible = build_rich_recap_summary(&RichRecapSummaryConfig {
+            title: &chat_title,
+            hours,
+            automatic: true,
+            initiator_name: "",
+            initiator_user_id: 0,
+            condensed_summary: &condensed_summary,
+            general_group_notice: chat.is_group(),
+            subscription_chat_title,
+            condensed_trace: Some(&condensed_trace),
+            recap_trace: Some(&detailed.trace),
+        });
+        compose_rich_recap_messages(&visible, &detailed.summaries)
+    };
+
+    let public_parts = if options.auto_recap_send_mode == 0 {
+        build_parts("")
+    } else {
+        Vec::new()
+    };
+    let subscriber_parts = if subscribers.is_empty() {
+        Vec::new()
+    } else {
+        build_parts(&chat_title)
+    };
+    let subscriber_ids = subscribers
+        .iter()
+        .map(|subscriber| subscriber.user_id)
+        .collect::<Vec<_>>();
+    let targets = build_auto_recap_targets(chat_id, options.auto_recap_send_mode, &subscriber_ids);
+
+    let mut delivery_targets = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (parts, keyboard) = if target.is_private_subscriber {
+            let keyboard = match build_subscriber_vote_keyboard(
+                state.as_ref(),
+                chat_id,
+                &chat_title,
+                target.chat_id,
+                &detailed.log_id,
+                counts,
+            )
+            .await
+            {
+                Ok(keyboard) => keyboard,
+                Err(source) => {
+                    error!(
+                        chat_id,
+                        target_chat_id = target.chat_id,
+                        error = %source,
+                        "failed to build subscriber automatic recap keyboard"
                     );
                     continue;
                 }
             };
-
-        // Need at least 5 text messages
-        let text_count = messages.iter().filter(|m| !m.text.is_empty()).count();
-        if text_count < 5 {
-            // Update last_recap_at to avoid re-triggering this slot
-            update_last_recap_at(&ctx, cfg.chat_id, now).await;
+            (subscriber_parts.clone(), keyboard)
+        } else {
+            (public_parts.clone(), public_keyboard.clone())
+        };
+        if parts.is_empty() {
+            error!(
+                chat_id,
+                target_chat_id = target.chat_id,
+                "automatic Rich recap composer returned no messages"
+            );
             continue;
         }
-
-        match service
-            .generate_dual_recap(&messages, &ctx.config.locale, cfg.chat_id, &ctx.i18n)
-            .await
-        {
-            Ok(output) => {
-                let chat_title = extract_chat_title(&cfg);
-                let page_title = ctx.i18n.t(
-                    ctx.config.locale,
-                    "recap.auto_page_title",
-                    &[("chat", &chat_title)],
-                );
-
-                let nodes = build_recap_nodes(
-                    &output.condensed_summary,
-                    &output.segmented_summary,
-                    &output.trace,
-                    cfg.chat_id,
-                    &ctx.config.locale,
-                    &ctx.i18n,
-                );
-
-                let telegraph_url = if let Some(ref telegraph) = ctx.telegraph {
-                    match telegraph.create_page_auto_nodes(&page_title, &nodes).await {
-                        Ok(urls) => urls.first().cloned(),
-                        Err(err) => {
-                            warn!("telegraph page creation failed (auto_recap): {err:?}");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                fn esc(text: &str) -> String {
-                    text.replace('&', "&amp;")
-                        .replace('<', "&lt;")
-                        .replace('>', "&gt;")
-                }
-
-                let footer = output
-                    .trace
-                    .build_status_lines(&ctx.config.locale, &ctx.i18n);
-
-                let final_text = if let Some(url) = telegraph_url {
-                    ctx.i18n.t(
-                        ctx.config.locale,
-                        "recap.auto_published",
-                        &[
-                            ("url", &url),
-                            ("title", &esc(&page_title)),
-                            ("condensed", &esc(&output.condensed_summary)),
-                            ("group", &chat_title),
-                            ("footer", &footer),
-                        ],
-                    )
-                } else {
-                    ctx.i18n.t(
-                        ctx.config.locale,
-                        "recap.auto_no_telegraph",
-                        &[
-                            ("condensed", &esc(&output.condensed_summary)),
-                            ("segmented", &output.segmented_summary_html),
-                            ("group", &chat_title),
-                            ("footer", &footer),
-                        ],
-                    )
-                };
-
-                let send_result = bot
-                    .send_message(ChatId(cfg.chat_id), final_text.clone())
-                    .parse_mode(teloxide::types::ParseMode::Html)
-                    .await;
-
-                // Only advance last_recap_at on successful delivery
-                if let Ok(sent_msg) = &send_result {
-                    if cfg.pin_auto_recap_message {
-                        handle_pin(&bot, &ctx, &cfg, sent_msg.id).await;
-                    }
-                    update_last_recap_at(&ctx, cfg.chat_id, now).await;
-                } else if let Err(err) = &send_result {
-                    warn!("auto_recap send to chat {} failed: {err:?}", cfg.chat_id);
-                }
-            }
-            Err(err) => warn!("auto_recap for chat {} failed: {err:?}", cfg.chat_id),
-        }
+        delivery_targets.push(AutoRecapDeliveryTarget {
+            chat_id: target.chat_id,
+            parts,
+            keyboard: Some(keyboard),
+            pin_first: options.pin_auto_recap_message && !target.is_private_subscriber,
+        });
     }
 
-    info!("auto_recap completed");
+    let limiter = Arc::new(GoRateLimiter::per_second(5));
+    let before_send: BeforeSendHook = Arc::new(move || {
+        let limiter = limiter.clone();
+        Box::pin(async move { limiter.take().await })
+    });
+    let sender = TelegramRecapSender::new(ctx.raw_telegram_http.clone(), &ctx.config.telegram);
+    deliver_auto_recap_targets(&ctx.db, &sender, &bot, delivery_targets, Some(before_send)).await;
     Ok(())
 }
 
-/// Handle pin/unpin logic for auto-recap messages.
-async fn handle_pin(bot: &Bot, ctx: &AppContext, cfg: &RecapConfig, new_msg_id: MessageId) {
-    let chat_id = ChatId(cfg.chat_id);
-
-    // Unpin previous recap message if tracked
-    if let Some(prev_id) = cfg.last_pinned_message_id
-        && let Err(err) = bot
-            .unpin_chat_message(chat_id)
-            .message_id(MessageId(prev_id as i32))
-            .await
-    {
-        warn!(
-            "failed to unpin previous recap message {} in chat {}: {err:?}",
-            prev_id, cfg.chat_id
-        );
-    }
-
-    // Pin the new message
-    match bot.pin_chat_message(chat_id, new_msg_id).await {
-        Ok(_) => {
-            // Store the pinned message ID
-            if let Err(err) = crate::db::recap_config::set_last_pinned_message_id(
-                &ctx.db.pool,
-                cfg.chat_id,
-                Some(new_msg_id.0 as i64),
-            )
-            .await
-            {
-                warn!("failed to store pinned message id: {err:?}");
-            }
-        }
-        Err(err) => {
-            warn!(
-                "failed to pin recap message in chat {}: {err:?}",
-                cfg.chat_id
-            );
-            // Clear tracked pin since we couldn't pin
-            let _ = crate::db::recap_config::set_last_pinned_message_id(
-                &ctx.db.pool,
-                cfg.chat_id,
-                None,
-            )
-            .await;
-        }
-    }
-}
-
-async fn update_last_recap_at(ctx: &AppContext, chat_id: i64, now: i64) {
-    if let Err(err) = crate::db::recap_config::set_last_recap_at(&ctx.db.pool, chat_id, now).await {
-        warn!("update last_recap_at failed: {err:?}");
-    }
-}
-
-fn extract_chat_title(cfg: &RecapConfig) -> String {
-    cfg.chat_id.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::models::RecapConfig;
-
-    fn make_config(rates: i32, last_recap_at: Option<i64>) -> RecapConfig {
-        RecapConfig {
-            chat_id: -100123,
-            enabled: true,
-            auto_recap_enabled: true,
-            last_recap_at,
-            updated_at: None,
-            auto_recap_rates_per_day: rates,
-            pin_auto_recap_message: false,
-            last_pinned_message_id: None,
-        }
-    }
-
-    #[test]
-    fn schedule_slots_2x() {
-        assert_eq!(schedule_slots(2), &[8, 20]);
-    }
-
-    #[test]
-    fn schedule_slots_3x() {
-        assert_eq!(schedule_slots(3), &[0, 8, 16]);
-    }
-
-    #[test]
-    fn schedule_slots_4x() {
-        assert_eq!(schedule_slots(4), &[2, 8, 14, 20]);
-    }
-
-    #[test]
-    fn message_windows() {
-        assert_eq!(message_window_hours(2), 12);
-        assert_eq!(message_window_hours(3), 8);
-        assert_eq!(message_window_hours(4), 6);
-    }
-
-    #[test]
-    fn due_when_never_recapped_and_slot_matches() {
-        // 08:30 UTC => hour 8
-        let now = 86400 + 8 * 3600 + 1800; // day 1, 08:30
-        let cfg = make_config(2, None); // 2x: slots [8, 20]
-        assert!(is_due_for_recap(&cfg, now));
-    }
-
-    #[test]
-    fn not_due_when_wrong_hour() {
-        // 10:00 UTC => hour 10 (not in 2x slots [8, 20])
-        let now = 86400 + 10 * 3600;
-        let cfg = make_config(2, None);
-        assert!(!is_due_for_recap(&cfg, now));
-    }
-
-    #[test]
-    fn not_due_when_already_recapped_this_slot() {
-        // 08:30 UTC, last recapped at 08:15 today
-        let today_start = 86400;
-        let now = today_start + 8 * 3600 + 1800;
-        let last = today_start + 8 * 3600 + 900; // 08:15 > slot start 08:00
-        let cfg = make_config(4, Some(last)); // 4x: slots [2, 8, 14, 20]
-        assert!(!is_due_for_recap(&cfg, now));
-    }
-
-    #[test]
-    fn due_when_last_recap_before_slot_start() {
-        // 08:30 UTC, last recapped yesterday at 20:30
-        let today_start = 86400;
-        let now = today_start + 8 * 3600 + 1800;
-        let last = 20 * 3600 + 1800; // yesterday 20:30
-        let cfg = make_config(4, Some(last));
-        assert!(is_due_for_recap(&cfg, now));
-    }
-
-    #[test]
-    fn due_for_3x_at_midnight() {
-        // 00:15 UTC => hour 0 (in 3x slots [0, 8, 16])
-        let now = 86400 + 900;
-        let cfg = make_config(3, None);
-        assert!(is_due_for_recap(&cfg, now));
+fn telegram_chat_type(chat: &ChatFullInfo) -> &'static str {
+    if chat.is_group() {
+        CHAT_TYPE_GROUP
+    } else if chat.is_supergroup() {
+        CHAT_TYPE_SUPERGROUP
+    } else if chat.is_channel() {
+        "channel"
+    } else {
+        "private"
     }
 }
