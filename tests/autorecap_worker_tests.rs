@@ -9,7 +9,7 @@ use insights_bot_telegram_rs::{
     db::models::{TelegramChatAutoRecapsSubscriber, TelegramChatRecapsOptions},
     redis::{
         keys,
-        recap_state::{InMemoryRecapStateStore, TestClock},
+        recap_state::{InMemoryRecapStateStore, ManualRecapRateResult, RecapStateStore, TestClock},
     },
     services::autorecap::{
         AutoRecapPreparation, AutoRecapStartupSeeder, AutoRecapStateReader,
@@ -355,4 +355,167 @@ fn automatic_generation_requires_more_than_five_physical_rows() {
     assert!(!has_enough_auto_recap_histories(0));
     assert!(!has_enough_auto_recap_histories(5));
     assert!(has_enough_auto_recap_histories(6));
+}
+
+/// Wraps [`InMemoryRecapStateStore`] to count `auto_recap_zadd` calls, so a test
+/// can observe how many times `queue_next_auto_recap` actually ran without a
+/// production-side counter.
+struct CountingQueueStore {
+    inner: InMemoryRecapStateStore,
+    zadd_calls: AtomicUsize,
+}
+
+impl CountingQueueStore {
+    fn wrap(inner: InMemoryRecapStateStore) -> Self {
+        Self {
+            inner,
+            zadd_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn zadd_calls(&self) -> usize {
+        self.zadd_calls.load(Ordering::SeqCst)
+    }
+
+    fn raw_zset(&self, key: &str) -> Option<Vec<(i64, String)>> {
+        self.inner.raw_zset(key)
+    }
+}
+
+#[async_trait]
+impl RecapStateStore for CountingQueueStore {
+    async fn put_callback(&self, route: &str, payload_json: &str) -> anyhow::Result<String> {
+        self.inner.put_callback(route, payload_json).await
+    }
+
+    async fn get_callback(&self, route: &str, action_hash: &str) -> anyhow::Result<Option<String>> {
+        self.inner.get_callback(route, action_hash).await
+    }
+
+    async fn check_manual_recap_rate(
+        &self,
+        chat_id: i64,
+        rate: i64,
+        per_seconds: i64,
+    ) -> anyhow::Result<ManualRecapRateResult> {
+        self.inner
+            .check_manual_recap_rate(chat_id, rate, per_seconds)
+            .await
+    }
+
+    async fn put_start_context(
+        &self,
+        domain: keys::StartContextDomain,
+        token: &str,
+        json: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.put_start_context(domain, token, json).await
+    }
+
+    async fn get_start_context(
+        &self,
+        domain: keys::StartContextDomain,
+        token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.inner.get_start_context(domain, token).await
+    }
+
+    async fn forwarded_active(&self, user_id: i64) -> anyhow::Result<bool> {
+        self.inner.forwarded_active(user_id).await
+    }
+
+    async fn start_forwarded(&self, user_id: i64) -> anyhow::Result<()> {
+        self.inner.start_forwarded(user_id).await
+    }
+
+    async fn append_forwarded(
+        &self,
+        user_id: i64,
+        score_ms: i64,
+        json: &str,
+    ) -> anyhow::Result<()> {
+        self.inner.append_forwarded(user_id, score_ms, json).await
+    }
+
+    async fn forwarded_batch(&self, user_id: i64) -> anyhow::Result<Vec<String>> {
+        self.inner.forwarded_batch(user_id).await
+    }
+
+    async fn cancel_forwarded(&self, user_id: i64) -> anyhow::Result<bool> {
+        self.inner.cancel_forwarded(user_id).await
+    }
+
+    async fn push_delete_later(
+        &self,
+        user_id: i64,
+        chat_id: i64,
+        message_id: i32,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .push_delete_later(user_id, chat_id, message_id)
+            .await
+    }
+
+    async fn drain_delete_later(&self, user_id: i64) -> anyhow::Result<Vec<(i64, i32)>> {
+        self.inner.drain_delete_later(user_id).await
+    }
+
+    async fn auto_recap_zadd(&self, member: &str, score_ms: i64) -> anyhow::Result<()> {
+        self.zadd_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.auto_recap_zadd(member, score_ms).await
+    }
+
+    async fn auto_recap_zpop_due(&self, now_ms: i64) -> anyhow::Result<Option<String>> {
+        self.inner.auto_recap_zpop_due(now_ms).await
+    }
+
+    async fn auto_recap_zrem(&self, member: &str) -> anyhow::Result<()> {
+        self.inner.auto_recap_zrem(member).await
+    }
+}
+
+/// A chat that stays enabled but whose subscriber read never recovers within
+/// the ten allotted attempts still requeues twice, matching Go's error-path
+/// requeue followed by the normal requeue, and still reaches `Generate` with
+/// whatever subscribers were readable (none, here).
+#[tokio::test]
+async fn partial_subscriber_read_failure_still_requeues_twice_before_generating() {
+    let reader = ScriptedReader::new(0, 0, usize::MAX);
+    let store = CountingQueueStore::wrap(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        NOW_MS,
+    ))));
+
+    let preparation = prepare_auto_recap(&reader, &store, CHAT_ID, 0, NOW_MS)
+        .await
+        .expect("a recovered options read still resolves a preparation");
+
+    let AutoRecapPreparation::Generate {
+        options,
+        subscribers,
+    } = preparation
+    else {
+        panic!("an enabled chat with recovered options should still generate");
+    };
+    assert_eq!(
+        reader.subscriber_calls(),
+        10,
+        "the subscriber read exhausts all ten attempts"
+    );
+    assert_eq!(options.auto_recap_rates_per_day, 4);
+    assert!(
+        subscribers.is_empty(),
+        "an exhausted subscriber read degrades to an empty list rather than failing"
+    );
+    assert_eq!(
+        store.zadd_calls(),
+        2,
+        "the read-error requeue and the normal enabled-path requeue both run"
+    );
+    assert_eq!(
+        store
+            .raw_zset(keys::AUTO_RECAP_QUEUE_KEY)
+            .map(|zset| zset.len()),
+        Some(1),
+        "both requeues upsert the same deterministic member, so only one entry remains"
+    );
 }
