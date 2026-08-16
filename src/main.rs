@@ -203,6 +203,13 @@ fn load_env_lenient(path: &Path) -> Result<()> {
                 continue;
             }
 
+            // dotenv semantics: a variable already present in the process
+            // environment wins over the .env file. The strict `dotenvy` path
+            // never overrides, so the lenient fallback must not either.
+            if std::env::var_os(key).is_some() {
+                continue;
+            }
+
             // Setting env vars is inherently process-global; mark explicit unsafe block
             // to satisfy targets that treat `set_var` as unsafe.
             unsafe {
@@ -226,4 +233,39 @@ fn ensure_directories(dirs: &[&str]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::load_env_lenient;
+
+    #[test]
+    fn the_lenient_loader_keeps_existing_process_env_precedence() {
+        let path = std::env::temp_dir().join(format!(
+            "insights_lenient_env_precedence_{}.env",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).expect("temp .env");
+        writeln!(file, "INSIGHTS_TEST_LENIENT_PRESET=from-file").expect("write preset line");
+        writeln!(file, "INSIGHTS_TEST_LENIENT_FRESH=fresh value with spaces")
+            .expect("write fresh line");
+        drop(file);
+
+        unsafe { std::env::set_var("INSIGHTS_TEST_LENIENT_PRESET", "from-process") };
+        load_env_lenient(&path).expect("lenient load");
+
+        assert_eq!(
+            std::env::var("INSIGHTS_TEST_LENIENT_PRESET").expect("preset var"),
+            "from-process",
+            "a variable already present in the process environment wins"
+        );
+        assert_eq!(
+            std::env::var("INSIGHTS_TEST_LENIENT_FRESH").expect("fresh var"),
+            "fresh value with spaces",
+            "variables absent from the process environment come from the file"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
