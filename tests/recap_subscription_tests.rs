@@ -758,10 +758,11 @@ async fn help_command_with_english_language_code_keeps_the_recap_group_in_chines
 
 /// `zh-tw` is not one of Go's own locale tags, but this port ships a
 /// zh-Hant bundle Go lacks, so `Locale::from_language_code` routes it there
-/// -- a documented divergence. `AppConfig::locale` is pinned to `zh-Hans`
-/// here so the resulting English-language text can only be explained by the
-/// sender's `language_code` overriding the configured fallback, not by
-/// coincidentally matching it.
+/// -- a documented divergence. The zh-Hant bundle's basic-group keys carry
+/// the Simplified text Go's matcher would actually serve a zh-TW sender
+/// (every zh-* tag resolves to zh-CN there). `AppConfig::locale` stays the
+/// default English here so the Chinese reply can only be explained by the
+/// sender's `language_code` overriding the configured fallback.
 #[tokio::test]
 async fn help_command_with_zh_tw_language_code_overrides_the_configured_zh_hans_locale() {
     let server = MockServer::start().await;
@@ -785,8 +786,7 @@ async fn help_command_with_zh_tw_language_code_overrides_the_configured_zh_hans_
     let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
         START_MS,
     ))));
-    let context =
-        command_context_with_insights_lang(&server, database, state, Some("zh-Hans")).await;
+    let context = command_context_with_insights_lang(&server, database, state, None).await;
 
     SystemHandlers::handle_help(
         context.config.telegram.bot(),
@@ -804,13 +804,13 @@ async fn help_command_with_zh_tw_language_code_overrides_the_configured_zh_hans_
     let reply = request_body(&requests[1]);
     let reply_text = reply["text"].as_str().expect("reply text is a string");
     assert!(
-        reply_text.starts_with("Greetings! 👋 Welcome to using Insights Bot!"),
-        "zh-TW resolves to the zh-Hant locale, which has no Go bundle to \
-         draw on and so falls back to the English basic-group text (a \
-         documented divergence) -- overriding the configured zh-Hans \
-         default rather than coincidentally matching it"
+        reply_text.starts_with("你好！👋 欢迎使用 Insights Bot！"),
+        "zh-TW resolves to the zh-Hant locale, whose basic-group keys carry \
+         the Simplified text Go's matcher serves every zh-* sender -- \
+         overriding the configured English default rather than \
+         coincidentally matching it"
     );
-    assert!(reply_text.contains("<b>Basic Commands</b>"));
+    assert!(reply_text.contains("<b>基础命令</b>"));
     assert!(reply_text.contains("/recap@TestBot - 总结过去的聊天记录并生成回顾快报"));
     assert_eq!(reply["parse_mode"], "HTML");
     assert_eq!(reply["reply_parameters"]["message_id"], 91);

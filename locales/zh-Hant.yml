@@ -4,8 +4,9 @@
 system:
   welcome: "歡迎使用 Insights Bot！我可以幫助你回顧和總結聊天記錄。"
   cancel: "目前沒有正在進行的操作"
-  # Go v1.0.0 只提供 en / zh-CN 語言包，沒有繁體中文版本，依 Go 的 bundle
-  # fallback 設計（預設語言為 English）改用其英文原文，不自創繁體中文譯文
+  # Go v1.0.0 只提供 en / zh-CN 語言包；其 BCP 47 matcher 會把所有 zh-*
+  # 使用者（含 zh-TW/zh-HK）解析到 zh-CN，所以缺繁體譯文的 key 一律沿用
+  # Go 對這些使用者實際輸出的簡體文本，不自創繁體譯文
   # （pkg/bots/tgbot/help_command.go:44-101，對照
   # system.commands.groups.basic.* 結構）。聊天回顧指令組的組名與各指令說明
   # 是 Go 源碼裡的字面量，不經過 i18n（見 system.rs 的 RECAP_GROUP），因此
@@ -13,20 +14,20 @@ system:
   commands:
     groups:
       basic:
-        name: "Basic Commands"
+        name: "基础命令"
         commands:
           help:
-            help: "Obtain assistance"
+            help: "获取帮助"
             message: |
-              Greetings! 👋 Welcome to using Insights Bot!
+              你好！👋 欢迎使用 Insights Bot！
 
-              I currently support these commands:
+              我当前支持这些命令：
 
               {Commands}
           cancel:
-            help: "Cancel any ongoing operations."
+            help: "取消当前操作"
           start:
-            help: "Begin interacting with the bot"
+            help: "开始与 Bot 的交互"
 
 # 回顧相關訊息
 recap:
@@ -108,36 +109,34 @@ prompts:
   sarcastic_user: "以下是一段聊天記錄，請給出你的總結：\n\n聊天記錄：\"\"\"\n{chat_history}\n\"\"\"\n\n請直接給出總結，不要加任何解釋。"
   bullet_system: "你是一位精煉的聊天記錄總結員。請將提供的聊天記錄總結成要點，包含關鍵話題、決策和行動項目。\n\n要求：\n- 使用繁體中文回覆\n- 最多10個要點\n- 每個要點簡潔明瞭\n- 保留重要的用戶名和上下文\n- 每個要點末尾用方括號引用相關 msgId 編號，例如 [633577] 或 [633577][633579]；msgId 已在輸入中標記（格式 msgId:123: ...），可引用多個以覆蓋證據。"
 
-# 群組遷移通知：Go v1.0.0 只提供 en / zh-CN 語言包，沒有繁體中文版本，
-# 依 Go 的 bundle fallback 設計（預設語言為 English）改用其英文原文，
-# 不自創繁體中文譯文（chatmigrate.go:148-166）
+# 群組遷移通知：Go v1.0.0 沒有繁體語言包，其 matcher 會把 zh-* 使用者解析到
+# zh-CN，故沿用 Go 實際輸出的簡體文本，不自創繁體譯文（chatmigrate.go:148-166）
 migration:
-  notification: "{Name} @{Username} has observed your group's upgrading to a <b>supergroup</b>, where the group ID will change. Rest assured, we've smoothly transitioned all historical data to the new group ID, while maintaining all your settings unaltered. However, due to Telegram's limitations, message IDs from before the upgrade won't match those sent after and will thus be excluded from future summaries. We regret any inconvenience caused by such migrations."
+  notification: "{Name} @{Username} 监测到您的群组已从 <b>群组（group）</b> 升级为了 <b>超级群组（supergroup）</b>，届时，群组的 ID 将会发生变更，<b>现已自动将过去的历史记录和数据留存自动迁移到了新的群组 ID 名下</b>，之前的设置将会保留并继续沿用，不过需要注意的是，由于 Telegram 官方的限制，迁移事件前的消息 ID 将无法与今后发送的消息 ID 相兼容，所以当下一次总结消息时将不会包含在迁移事件发生前所发送的消息，由此带来的不便敬请谅解。"
 
-# Bot 加入群組歡迎訊息：Go v1.0.0 只提供 en / zh-CN 語言包，沒有繁體中文版本，
-# 依 Go 的 bundle fallback 設計（預設語言為 English）改用其英文原文，
-# 不自創繁體中文譯文（welcome.go:137-184，對應
-# modules.telegram.welcome.messageNormalGroup）
+# Bot 加入群組歡迎訊息：Go v1.0.0 沒有繁體語言包，其 matcher 會把 zh-*
+# 使用者解析到 zh-CN，故沿用 Go 實際輸出的簡體文本，不自創繁體譯文
+# （welcome.go:137-184，對應 modules.telegram.welcome.messageNormalGroup）
 welcome:
   message_normal_group: |
-    🤗 Welcome to @{Username}!
+    🤗 欢迎使用 @{Username}！
 
-    - Use /smr@{Username} <code>article link</code> for article readings.
+    - 如果要让我帮忙阅读网页文章，请直接使用开箱即用的命令 /smr@{Username} <code>要阅读的链接</code>；
 
-    - For chat history summaries, please assign me as admin (all permissions can be omitted) using a <b>non-anonymous identity</b> (recommended, otherwise permission validation may fail. Then, start /configure_recap@{Username} to configure chat recap.
+    - 如果想要我帮忙总结本群组的聊天记录，请以<b>管理员</b>身份将我配置为本群组的管理员（可以关闭所有权限），然后在<b>非匿名和非其他身份的身份</b>下（推荐，否则容易出现权限识别错误的情况）发送 /configure_recap@{Username} 来开始配置本群组的聊天回顾功能。
 
-    - Removing my admin status is a simple way to delete all bot-recorded messages, automatically purging bot data unless modifications have been made by another maintainer.
+    - 如果你在授权 Bot 管理员之后希望 Bot 将已经记录的消息全数移除，可以通过撤销 Bot 的管理员权限来触发 Bot 的历史数据自动清理（如果该部分代码未经其他 Bot 实例维护者修改的话）。
 
-    ⚠️ Your group isn't a supergroup yet; message reference linking will not work.
+    ⚠️ 警告：你的群组尚未是超级群组（supergroup）。<b>普通群组的消息链接引用功能无法正常工作。</b>
 
-    To enable message reference linking:
+    如果你希望使用消息链接引用功能，请通过下面任意操作使其正常运作：
 
-    - Temporarily switch your group to public, then revert to private.
-    - Upgrade to a supergroup by other means.
+    - 短时间内将群组开放为公共群组并快速还原回私有群组；
+    - 通过其他操作将本群组升级为超级群组；
 
-    Questions?
+    如果还有疑问的话可以通过
 
-    1. Consult /help@{Username} for command details.
-    2. Visit our <a href="https://github.com/nekomeowww/insights-bot">GitHub</a> for support.
+    1. 执行帮助命令 /help@{Username} 来查看支持的命令；
+    2. 前往 Bot 所在的<a href="https://github.com/nekomeowww/insights-bot">开源仓库</a>提交 Issue 问询开发者。
 
-    Enjoy your experience!
+    祝你使用愉快！

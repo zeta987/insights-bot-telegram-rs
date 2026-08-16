@@ -34,10 +34,12 @@ ruled.
   the toggle and pin paths instead of reproducing Go's nil-pointer process
   crash; the mode handler's impossible missing-row arm edits the general
   error text.
-- Go's i18n registers every locale bundle under the zh-CN language tag, so
-  production Go serves Simplified Chinese regardless of the stored language.
-  Rust serves each bundle under its own locale and falls back to English for
-  codes it does not carry (including zh-Hant texts Go never shipped).
+- Go ships only `en` and `zh-CN` bundles and its BCP 47 matcher resolves
+  every `zh-*` sender (including zh-TW/zh-HK) to `zh-CN`. Rust serves each
+  of its three bundles under its own locale via a case-insensitive
+  language-code mapping; zh-Hant keys that Go never shipped in Traditional
+  carry the Simplified text Go would actually serve those users, so no
+  translations are invented and no Chinese user regresses to English.
 - Message-entity offsets are computed with checked UTF-16 arithmetic where
   Go would panic on surrogate-boundary edge cases; the divergence is pinned
   by `tests/message_entity_tests.rs`.
