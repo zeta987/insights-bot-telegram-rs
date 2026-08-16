@@ -245,9 +245,22 @@ non-`/smr` Telegram callsite matches pinned Go or appears in
 `docs/parity/go-parity-deviations.md`, and the test pool is closed except
 the `AUTO_RECAP_TEST_ENABLED` immediate path recorded there.
 
-Nothing mechanical remains. Open items are the owner's: push the remaining
-local commits when ready, and optionally run the live Telegram test — port
-9487 and AyuGram are available after local verification.
+The live Telegram verification ran on 2026-08-16 through the owner's bore
+webhook tunnel on port 9487 with AyuGram against a real group. Verified
+end-to-end: the composite `/health` JSON staying up, `/help`, the
+`/configure_recap` disabled five-row keyboard, toggle-enable editing in
+place to the nine-row keyboard with Go's exact selection markers and
+success text, the `/recap` six-hour selector, the insufficient-history
+branch (waiting message kept plus the under-five error), a full Rich recap
+generation through the OpenAI relay with the owner's custom condensed
+prompts, the model-info footer, the expandable details section, the
+feedback keyboard, and a 👍 reaction incrementing its count via the
+markup-edit callback. The run surfaced and fixed one real regression (the
+dispatcher wedge, `fix: keep the dispatcher off runtime workers`) and one
+latent loader bug (`fix: keep process env precedence in lenient loader`).
+
+Nothing mechanical remains. The only open item is the owner's: push the
+remaining local commits when ready.
 
 ## Mandatory repository rules
 
