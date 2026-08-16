@@ -13,7 +13,6 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 dotenvy = "0.15"
 encoding_rs = "0.8"
 futures = "0.3"
-governor = { version = "0.6", features = ["dashmap"] }
 axum = { version = "0.7", features = ["macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,7 +34,6 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-nonzero_ext = "0.3"
 reqwest = { version = "0.12.24", features = ["json"] }
 regex = "1"
 scraper = "0.27"

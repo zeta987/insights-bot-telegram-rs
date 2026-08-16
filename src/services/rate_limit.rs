@@ -1,45 +1,12 @@
 use std::{
-    num::NonZeroU32,
     sync::{
-        Arc, Mutex,
+        Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use anyhow::Result;
-use governor::{
-    Quota, RateLimiter, clock::DefaultClock, middleware::NoOpMiddleware,
-    state::keyed::DefaultKeyedStateStore,
-};
-use nonzero_ext::nonzero;
 use tokio::time::Instant;
-
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct RateKey(pub i64, pub &'static str);
-
-#[derive(Clone)]
-pub struct CommandRateLimiter {
-    limiter:
-        Arc<RateLimiter<RateKey, DefaultKeyedStateStore<RateKey>, DefaultClock, NoOpMiddleware>>,
-}
-
-impl CommandRateLimiter {
-    pub fn new(ops_per_window: u32, window: Duration) -> Self {
-        let quota = Quota::with_period(window)
-            .unwrap()
-            .allow_burst(NonZeroU32::new(ops_per_window).unwrap_or(nonzero!(1u32)));
-        Self {
-            limiter: Arc::new(RateLimiter::keyed(quota)),
-        }
-    }
-
-    pub fn check(&self, key: RateKey) -> Result<()> {
-        self.limiter
-            .check_key(&key)
-            .map_err(|e| anyhow::anyhow!(e.to_string()))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Go's `go.uber.org/ratelimit` limiter
@@ -50,9 +17,7 @@ pub const GO_RATE_LIMITER_DEFAULT_SLACK: u32 = 10;
 
 /// Go's `go.uber.org/ratelimit@v0.3.1` `atomicInt64Limiter`, ported literally.
 ///
-/// This is deliberately *not* [`CommandRateLimiter`]: that one is keyed per
-/// chat, non-blocking, and models Telegram's per-command quota, whereas Go's
-/// OpenAI limiter is unkeyed, blocking, and shared by every caller of one
+/// This is unkeyed, blocking, and shared by every caller of one
 /// `OpenAIClient`. Go builds it as `ratelimit.New(1)`, so `per` is one second,
 /// `rate` is one, and `slack` is the package default of ten.
 ///

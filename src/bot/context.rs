@@ -8,10 +8,7 @@ use crate::{
     i18n::I18n,
     lifecycle::LifecycleFlags,
     redis::recap_state::RecapStateStore,
-    services::{
-        message_capture::DynMessagePreprocessor, openai::OpenAiClient,
-        rate_limit::CommandRateLimiter, telegraph::TelegraphService,
-    },
+    services::{message_capture::DynMessagePreprocessor, openai::OpenAiClient},
 };
 
 #[derive(Clone)]
@@ -20,8 +17,6 @@ pub struct AppContext {
     pub db: Database,
     pub i18n: I18n,
     pub openai: OpenAiClient,
-    pub limiter: CommandRateLimiter,
-    pub telegraph: Option<TelegraphService>,
     /// Recap state store. Production always installs one; `None` exists for
     /// test injection and for handlers that are still being staged.
     pub recap_state: Option<Arc<dyn RecapStateStore>>,
@@ -68,8 +63,6 @@ impl AppContext {
         db: Database,
         i18n: I18n,
         openai: OpenAiClient,
-        limiter: CommandRateLimiter,
-        telegraph: Option<TelegraphService>,
         recap_runtime: RecapRuntimeDependencies,
     ) -> Arc<Self> {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -78,8 +71,6 @@ impl AppContext {
             db,
             i18n,
             openai,
-            limiter,
-            telegraph,
             recap_state: recap_runtime.recap_state,
             raw_telegram_http: recap_runtime.raw_telegram_http,
             message_preprocessor: recap_runtime.message_preprocessor,

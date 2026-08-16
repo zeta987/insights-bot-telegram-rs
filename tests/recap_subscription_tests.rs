@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use insights_bot_telegram_rs::{
     bot::{
@@ -29,10 +29,7 @@ use insights_bot_telegram_rs::{
         keys,
         recap_state::{InMemoryRecapStateStore, RecapStateStore, TestClock},
     },
-    services::{
-        openai::OpenAiClient,
-        rate_limit::{CommandRateLimiter, GoRateLimiter},
-    },
+    services::{openai::OpenAiClient, rate_limit::GoRateLimiter},
 };
 use serde_json::Value;
 use support::sqlite_fixture::SchemaFixture;
@@ -322,8 +319,6 @@ async fn command_context(
         database,
         I18n::load_from_dir("locales").expect("embedded locales"),
         openai,
-        CommandRateLimiter::new(1, Duration::from_secs(1)),
-        None,
         RecapRuntimeDependencies {
             recap_state: Some(state),
             raw_telegram_http: reqwest::Client::new(),

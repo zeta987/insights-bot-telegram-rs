@@ -33,7 +33,7 @@ use insights_bot_telegram_rs::{
         },
         autorecap_queue::decode_auto_recap_member,
         openai::OpenAiClient,
-        rate_limit::{CommandRateLimiter, GoRateLimiter},
+        rate_limit::GoRateLimiter,
     },
 };
 use support::sqlite_fixture::SchemaFixture;
@@ -94,8 +94,6 @@ async fn runtime_context(database: Database, state: Arc<dyn RecapStateStore>) ->
         database,
         I18n::load_from_dir("locales").expect("embedded locales"),
         openai,
-        CommandRateLimiter::new(1, Duration::from_secs(1)),
-        None,
         RecapRuntimeDependencies {
             recap_state: Some(state),
             raw_telegram_http: reqwest::Client::new(),
@@ -240,8 +238,6 @@ async fn wired_runtime_context(
         database,
         I18n::load_from_dir("locales").expect("embedded locales"),
         openai,
-        CommandRateLimiter::new(1, Duration::from_secs(1)),
-        None,
         RecapRuntimeDependencies {
             recap_state: Some(state),
             raw_telegram_http: reqwest::Client::new(),

@@ -14,7 +14,7 @@ Telegram-only rewrite of the recap bot inspired by the original Go implementatio
 - Telegram: `teloxide` (rustls)
 - DB: `sqlx::AnyPool` (Postgres preferred, fallback SQLite)
 - OpenAI client: `async-openai` (recap logic stubbed; ready for integration)
-- Rate limiting: `governor`
+- Rate limiting: in-crate Go-parity leaky bucket (`GoRateLimiter`) plus the Redis manual-recap counter
 - Logging: `tracing` / `tracing-subscriber`
 - i18n: YAML bundles via `serde_yaml`
 
@@ -146,7 +146,9 @@ The Rust service does not run directly on the legacy Go PostgreSQL schema. Migra
 - Webhook configuration and media/whisper placeholders remain outside the recap core scope.
 
 ### Rate limiting
-- `/recap` is limited per chat+command (default 3 requests per 60s); exceeding the limit replies with a friendly notice.
+- Public `/recap` follows Go's per-chat Redis counter (`HARD_LIMIT_MANUAL_RECAP_RATE_PER_SECONDS`,
+  loosened per chat only by a larger stored override); exceeding it replies with Go's rate-limit
+  notice. Automatic recap delivery is throttled at five sends per second.
 
 ## Status
 - Bot/handlers/services/db scaffolding is complete.

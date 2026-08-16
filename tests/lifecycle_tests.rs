@@ -16,10 +16,8 @@ use insights_bot_telegram_rs::{
     lifecycle::LifecycleFlags,
     redis::recap_state::{InMemoryRecapStateStore, RecapStateStore, TestClock},
     services::{
-        autorecap::run_autorecap_poll_loop,
-        autorecap_queue::AUTO_RECAP_POLL_INTERVAL,
-        openai::OpenAiClient,
-        rate_limit::{CommandRateLimiter, GoRateLimiter},
+        autorecap::run_autorecap_poll_loop, autorecap_queue::AUTO_RECAP_POLL_INTERVAL,
+        openai::OpenAiClient, rate_limit::GoRateLimiter,
     },
 };
 use serde_json::Value;
@@ -64,8 +62,6 @@ async fn runtime_context(database: Database, state: Arc<dyn RecapStateStore>) ->
         database,
         I18n::load_from_dir("locales").expect("embedded locales"),
         openai,
-        CommandRateLimiter::new(1, Duration::from_secs(1)),
-        None,
         RecapRuntimeDependencies {
             recap_state: Some(state),
             raw_telegram_http: reqwest::Client::new(),

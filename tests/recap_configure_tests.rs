@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use insights_bot_telegram_rs::{
@@ -23,9 +23,7 @@ use insights_bot_telegram_rs::{
         recap_state::{InMemoryRecapStateStore, ManualRecapRateResult, RecapStateStore, TestClock},
     },
     services::{
-        autorecap_queue::encode_auto_recap_member,
-        openai::OpenAiClient,
-        rate_limit::{CommandRateLimiter, GoRateLimiter},
+        autorecap_queue::encode_auto_recap_member, openai::OpenAiClient, rate_limit::GoRateLimiter,
     },
 };
 use serde_json::Value;
@@ -286,8 +284,6 @@ async fn command_context(
         database,
         I18n::load_from_dir("locales").expect("embedded locales"),
         openai,
-        CommandRateLimiter::new(1, Duration::from_secs(1)),
-        None,
         RecapRuntimeDependencies {
             recap_state: Some(state),
             raw_telegram_http: reqwest::Client::new(),

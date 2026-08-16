@@ -10,7 +10,7 @@
 
 mod support;
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use insights_bot_telegram_rs::{
     bot::{
@@ -25,10 +25,7 @@ use insights_bot_telegram_rs::{
     },
     i18n::I18n,
     redis::recap_state::{InMemoryRecapStateStore, TestClock},
-    services::{
-        openai::OpenAiClient,
-        rate_limit::{CommandRateLimiter, GoRateLimiter},
-    },
+    services::{openai::OpenAiClient, rate_limit::GoRateLimiter},
 };
 use serde_json::Value;
 use support::sqlite_fixture::SchemaFixture;
@@ -85,8 +82,6 @@ async fn test_context(server: &MockServer, database: Database) -> Arc<AppContext
         database,
         I18n::load_from_dir("locales").expect("embedded locales"),
         openai,
-        CommandRateLimiter::new(1, Duration::from_secs(1)),
-        None,
         RecapRuntimeDependencies {
             recap_state: Some(Arc::new(InMemoryRecapStateStore::new(Arc::new(
                 TestClock::new(START_MS),

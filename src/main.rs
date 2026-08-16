@@ -43,13 +43,6 @@ async fn run() -> Result<()> {
     .with_token_usage_recorder(Arc::new(
         services::recap_generation::DatabaseTokenUsageRecorder::new(database.clone()),
     ));
-    // Allow 3 recap requests per minute per chat/user
-    let limiter =
-        services::rate_limit::CommandRateLimiter::new(3, std::time::Duration::from_secs(60));
-    let telegraph = services::telegraph::TelegraphService::from_env();
-    if telegraph.is_some() {
-        info!("Telegraph service initialized");
-    }
     let recap_state = connect_recap_state(&config.redis).await?;
     // Built before `openai` is moved into the context, so the summarizer and
     // the handlers share one configured client.
@@ -59,8 +52,6 @@ async fn run() -> Result<()> {
         database.clone(),
         i18n,
         openai,
-        limiter,
-        telegraph,
         bot::context::RecapRuntimeDependencies {
             recap_state: Some(recap_state),
             message_preprocessor: Some(message_preprocessor),
