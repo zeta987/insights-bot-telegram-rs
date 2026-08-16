@@ -136,6 +136,29 @@ fn start_message(token: &str) -> Message {
     .expect("valid Telegram start fixture")
 }
 
+/// A private-chat `/help` message from a sender whose Telegram
+/// `language_code` is `language_code` (omitted entirely when `None`,
+/// matching a client that reports nothing).
+fn help_message(language_code: Option<&str>) -> Message {
+    let mut from = serde_json::json!({
+        "id": 42,
+        "is_bot": false,
+        "first_name": "Ada",
+        "username": "ada"
+    });
+    if let Some(code) = language_code {
+        from["language_code"] = Value::String(code.to_owned());
+    }
+    serde_json::from_value(serde_json::json!({
+        "message_id": 91,
+        "date": 1_710_000_010,
+        "from": from,
+        "chat": {"id": 42, "type": "private", "first_name": "Ada"},
+        "text": "/help"
+    }))
+    .expect("valid Telegram help fixture")
+}
+
 fn group_start_message(text: &str) -> Message {
     let command_length = text
         .split_whitespace()
@@ -279,7 +302,21 @@ async fn command_context(
     database: Database,
     state: Arc<dyn RecapStateStore>,
 ) -> Arc<AppContext> {
-    let values = BTreeMap::from([
+    command_context_with_insights_lang(server, database, state, None).await
+}
+
+/// Like [`command_context`], but sets `INSIGHTS_LANG` to `insights_lang`
+/// when given, pinning `AppConfig::locale` away from the default `en`. Used
+/// to prove that a message's own Telegram `language_code` overrides the
+/// configured fallback locale rather than merely matching it by
+/// coincidence.
+async fn command_context_with_insights_lang(
+    server: &MockServer,
+    database: Database,
+    state: Arc<dyn RecapStateStore>,
+    insights_lang: Option<&str>,
+) -> Arc<AppContext> {
+    let mut values = BTreeMap::from([
         ("TELEGRAM_BOT_TOKEN".to_owned(), "test-token".to_owned()),
         (
             "TELEGRAM_BOT_API_ENDPOINT".to_owned(),
@@ -305,6 +342,9 @@ async fn command_context(
         ),
         ("LOCALE".to_owned(), "zh-Hant".to_owned()),
     ]);
+    if let Some(insights_lang) = insights_lang {
+        values.insert("INSIGHTS_LANG".to_owned(), insights_lang.to_owned());
+    }
     let config =
         AppConfig::from_lookup(|key| values.get(key).cloned()).expect("subscription test config");
     let openai = OpenAiClient::new(
@@ -558,7 +598,6 @@ async fn missing_start_context_falls_back_to_the_localized_help_reply() {
         START_MS,
     ))));
     let context = command_context(&server, database, state).await;
-    let expected_help = context.i18n.t(context.config.locale, "system.help", &[]);
 
     SystemHandlers::handle_start(
         context.config.telegram.bot(),
@@ -584,9 +623,233 @@ async fn missing_start_context_falls_back_to_the_localized_help_reply() {
         "Go checks bot-admin status in /start and again in the help fallback"
     );
     let reply = request_body(&requests[2]);
-    assert_eq!(reply["text"], expected_help);
+    let reply_text = reply["text"].as_str().expect("reply text is a string");
+    // `start_message` carries no `from.language_code`, so this exercises the
+    // same config-locale fallback as `help_command_with_missing_language_code`
+    // below, proving Go's `/start` fallthrough (`start_command.go:44-53`)
+    // renders the identical composed `/help` body.
+    assert!(
+        reply_text.starts_with("Greetings! 👋 Welcome to using Insights Bot!"),
+        "a missing language_code falls back to the config locale (English), \
+         matching Go's i18n default"
+    );
+    assert!(
+        reply_text.contains("<b>Basic Commands</b>"),
+        "the basic group's own name and help text follow the resolved locale"
+    );
+    assert!(
+        reply_text.contains("/recap@TestBot - 总结过去的聊天记录并生成回顾快报"),
+        "the recap group's name and help text are Go string literals \
+         (recap.go:41-86), always Simplified Chinese regardless of locale"
+    );
     assert_eq!(reply["parse_mode"], "HTML");
     assert_eq!(reply["reply_parameters"]["message_id"], 91);
+}
+
+/// Go `pkg/bots/tgbot/context.go:141-156`: the locale is resolved from the
+/// *sender's* Telegram `language_code`, evaluated per message, not pinned
+/// at startup. `zh-hans` (Telegram's own lowercase tag) must resolve to the
+/// Simplified Chinese basic group.
+#[tokio::test]
+async fn help_command_with_zh_hans_language_code_renders_the_localized_basic_group() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_member_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(telegram_message_result(605, 42, "private", "help")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state).await;
+
+    SystemHandlers::handle_help(
+        context.config.telegram.bot(),
+        help_message(Some("zh-hans")),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("zh-Hans /help");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let reply = request_body(&requests[1]);
+    let reply_text = reply["text"].as_str().expect("reply text is a string");
+    assert!(
+        reply_text.starts_with("你好！👋 欢迎使用 Insights Bot！"),
+        "the sender's zh-hans language_code selects the Simplified Chinese \
+         basic-group text"
+    );
+    assert!(reply_text.contains("<b>基础命令</b>"));
+    assert!(reply_text.contains("/help@TestBot - 获取帮助"));
+    assert!(
+        reply_text.contains("/recap@TestBot - 总结过去的聊天记录并生成回顾快报"),
+        "the recap group is always Simplified Chinese regardless of locale \
+         (recap.go:41-86), so it renders the same text here as elsewhere"
+    );
+    assert_eq!(reply["parse_mode"], "HTML");
+    assert_eq!(reply["reply_parameters"]["message_id"], 91);
+}
+
+/// An explicit `en` `language_code` renders the basic group in English, but
+/// the recap group's Go-quirk Simplified Chinese text is unaffected --
+/// locking in that the recap group's help text is a fixed literal, not an
+/// i18n lookup (`recap.go:41-86`).
+#[tokio::test]
+async fn help_command_with_english_language_code_keeps_the_recap_group_in_chinese() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_member_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(telegram_message_result(606, 42, "private", "help")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state).await;
+
+    SystemHandlers::handle_help(
+        context.config.telegram.bot(),
+        help_message(Some("en")),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("en /help");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let reply = request_body(&requests[1]);
+    let reply_text = reply["text"].as_str().expect("reply text is a string");
+    assert!(reply_text.starts_with("Greetings! 👋 Welcome to using Insights Bot!"));
+    assert!(reply_text.contains("<b>Basic Commands</b>"));
+    assert!(reply_text.contains("/help@TestBot - Obtain assistance"));
+    assert!(
+        reply_text.contains("/recap@TestBot - 总结过去的聊天记录并生成回顾快报"),
+        "Go quirk: the recap group's name and help text are Simplified \
+         Chinese literals even when the rest of /help renders in English"
+    );
+    assert_eq!(reply["parse_mode"], "HTML");
+    assert_eq!(reply["reply_parameters"]["message_id"], 91);
+}
+
+/// `zh-tw` is not one of Go's own locale tags, but this port ships a
+/// zh-Hant bundle Go lacks, so `Locale::from_language_code` routes it there
+/// -- a documented divergence. `AppConfig::locale` is pinned to `zh-Hans`
+/// here so the resulting English-language text can only be explained by the
+/// sender's `language_code` overriding the configured fallback, not by
+/// coincidentally matching it.
+#[tokio::test]
+async fn help_command_with_zh_tw_language_code_overrides_the_configured_zh_hans_locale() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_member_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/SendMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(telegram_message_result(607, 42, "private", "help")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context =
+        command_context_with_insights_lang(&server, database, state, Some("zh-Hans")).await;
+
+    SystemHandlers::handle_help(
+        context.config.telegram.bot(),
+        // Mixed case, matching Go's case-insensitive-in-practice Telegram
+        // tags and exercising `Locale::from_language_code`'s
+        // case-insensitive match.
+        help_message(Some("zh-TW")),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("zh-TW /help");
+
+    let requests = server.received_requests().await.expect("Telegram requests");
+    let reply = request_body(&requests[1]);
+    let reply_text = reply["text"].as_str().expect("reply text is a string");
+    assert!(
+        reply_text.starts_with("Greetings! 👋 Welcome to using Insights Bot!"),
+        "zh-TW resolves to the zh-Hant locale, which has no Go bundle to \
+         draw on and so falls back to the English basic-group text (a \
+         documented divergence) -- overriding the configured zh-Hans \
+         default rather than coincidentally matching it"
+    );
+    assert!(reply_text.contains("<b>Basic Commands</b>"));
+    assert!(reply_text.contains("/recap@TestBot - 总结过去的聊天记录并生成回顾快报"));
+    assert_eq!(reply["parse_mode"], "HTML");
+    assert_eq!(reply["reply_parameters"]["message_id"], 91);
+}
+
+/// Go `help_command.go:44-58`: a bare (non-`@bot`) `/help` in a group where
+/// the bot is an administrator matches neither of the two allowed exact
+/// command forms, so the handler returns before sending anything.
+#[tokio::test]
+async fn administrator_group_bare_help_is_silent_before_reply() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/telegram/bottest-token/GetChatMember"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_administrator_result()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fixture = SchemaFixture::new();
+    let database = fixture.bootstrap_database().await;
+    let state = Arc::new(InMemoryRecapStateStore::new(Arc::new(TestClock::new(
+        START_MS,
+    ))));
+    let context = command_context(&server, database, state).await;
+
+    SystemHandlers::handle_help(
+        context.config.telegram.bot(),
+        group_start_message("/help"),
+        bot_me(),
+        context,
+    )
+    .await
+    .expect("bare administrator-group help");
+
+    let requests = server.received_requests().await.expect("Telegram request");
+    assert_eq!(requests.len(), 1, "Go stops after the administrator lookup");
+    assert_eq!(
+        requests[0].url.path(),
+        "/telegram/bottest-token/GetChatMember"
+    );
 }
 
 #[tokio::test]

@@ -3,18 +3,30 @@
 # 系統訊息
 system:
   welcome: "歡迎使用 Insights Bot！我可以幫助你回顧和總結聊天記錄。"
-  help: |
-    可用指令：
-    /start - 顯示歡迎訊息
-    /help - 顯示幫助
-    /cancel - 取消當前操作
-    /recap - 生成聊天回顧
-    /configure_recap - 配置回顧設定
-    /recap_forwarded_start - 開始接收私聊轉發訊息
-    /recap_forwarded - 總結已經轉發的訊息
-    /subscribe_recap - 訂閱定時聊天回顧
-    /unsubscribe_recap - 取消訂閱定時聊天回顧
   cancel: "目前沒有正在進行的操作"
+  # Go v1.0.0 只提供 en / zh-CN 語言包，沒有繁體中文版本，依 Go 的 bundle
+  # fallback 設計（預設語言為 English）改用其英文原文，不自創繁體中文譯文
+  # （pkg/bots/tgbot/help_command.go:44-101，對照
+  # system.commands.groups.basic.* 結構）。聊天回顧指令組的組名與各指令說明
+  # 是 Go 源碼裡的字面量，不經過 i18n（見 system.rs 的 RECAP_GROUP），因此
+  # 不受此政策影響，永遠顯示簡體中文。
+  commands:
+    groups:
+      basic:
+        name: "Basic Commands"
+        commands:
+          help:
+            help: "Obtain assistance"
+            message: |
+              Greetings! 👋 Welcome to using Insights Bot!
+
+              I currently support these commands:
+
+              {Commands}
+          cancel:
+            help: "Cancel any ongoing operations."
+          start:
+            help: "Begin interacting with the bot"
 
 # 回顧相關訊息
 recap:

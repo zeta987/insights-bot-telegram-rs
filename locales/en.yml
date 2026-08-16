@@ -3,18 +3,31 @@
 # System messages
 system:
   welcome: "Welcome to Insights Bot! I can help you recap and summarize chat histories."
-  help: |
-    Available commands:
-    /start - Show welcome message
-    /help - Show this help
-    /cancel - Cancel current operation
-    /recap - Generate chat recap
-    /configure_recap - Configure recap settings
-    /recap_forwarded_start - Start collecting privately forwarded messages
-    /recap_forwarded - Recap collected forwarded messages
-    /subscribe_recap - Subscribe to scheduled chat recaps
-    /unsubscribe_recap - Unsubscribe from scheduled chat recaps
   cancel: "No ongoing operations to cancel"
+  # Go `pkg/bots/tgbot/help_command.go:44-101` assembles /help dynamically
+  # from registered command groups rather than a single static block; these
+  # keys mirror Go's `locales/en.yaml` `system.commands.groups.basic.*`
+  # structure so `build_help_message` (src/bot/handlers/system.rs) can
+  # reproduce it. The recap command group's name and per-command help text
+  # are Go string literals, not i18n keys (see RECAP_GROUP in system.rs),
+  # so they have no entry here.
+  commands:
+    groups:
+      basic:
+        name: "Basic Commands"
+        commands:
+          help:
+            help: "Obtain assistance"
+            message: |
+              Greetings! 👋 Welcome to using Insights Bot!
+
+              I currently support these commands:
+
+              {Commands}
+          cancel:
+            help: "Cancel any ongoing operations."
+          start:
+            help: "Begin interacting with the bot"
 
 # Recap related messages
 recap:

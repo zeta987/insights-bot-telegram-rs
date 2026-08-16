@@ -38,6 +38,36 @@ impl Locale {
             Self::ZhHant => "zh-Hant",
         }
     }
+
+    /// Map a Telegram (or stored feature-flag) language code to a [`Locale`],
+    /// case-insensitively, falling back to `fallback` for a missing or empty
+    /// code.
+    ///
+    /// This is a documented i18n divergence from Go. Go's `Context.Language()`
+    /// (`pkg/bots/tgbot/context.go:141-156`) returns the sender's raw
+    /// `language_code` unmodified and always falls back to the literal
+    /// `"en"`; Go's i18n matcher then resolves that raw BCP 47 tag against
+    /// whichever locale bundles it has loaded, which in practice is only
+    /// `en` and `zh-CN`, so nearly every non-Chinese tag (and even most
+    /// Chinese region tags) resolves to English there. This port ships an
+    /// additional `zh-Hant` bundle Go does not have, so it is worth serving
+    /// Traditional-Chinese-region tags instead of leaving them on English:
+    /// `zh`, `zh-cn`, `zh-hans`, `zh-sg` resolve to [`Locale::ZhHans`];
+    /// `zh-tw`, `zh-hk`, `zh-mo`, `zh-hant` resolve to [`Locale::ZhHant`];
+    /// everything else resolves to [`Locale::En`]. Callers choose the
+    /// fallback for an absent code: Go's own default of `en` where no
+    /// operator-configured fallback exists, or `AppConfig::locale` where
+    /// this port wants an operator's `INSIGHTS_LANG` choice to still govern.
+    pub fn from_language_code(code: Option<&str>, fallback: Self) -> Self {
+        let Some(code) = code.filter(|code| !code.is_empty()) else {
+            return fallback;
+        };
+        match code.to_ascii_lowercase().as_str() {
+            "zh" | "zh-cn" | "zh-hans" | "zh-sg" => Self::ZhHans,
+            "zh-tw" | "zh-hk" | "zh-mo" | "zh-hant" => Self::ZhHant,
+            _ => Self::En,
+        }
+    }
 }
 
 #[derive(Clone)]

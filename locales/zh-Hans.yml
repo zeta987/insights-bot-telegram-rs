@@ -3,18 +3,30 @@
 # 系统消息
 system:
   welcome: "欢迎使用 Insights Bot！我可以帮助你回顾和总结聊天记录。"
-  help: |
-    可用命令：
-    /start - 显示欢迎消息
-    /help - 显示帮助
-    /cancel - 取消当前操作
-    /recap - 生成聊天回顾
-    /configure_recap - 配置回顾设置
-    /recap_forwarded_start - 使 Bot 接收在私聊中转发给 Bot 的消息，并在发送 /recap_forwarded 后开始总结
-    /recap_forwarded - 使 Bot 停止接收在私聊中转发给 Bot 的消息，对已经转发过的消息进行总结
-    /subscribe_recap - 订阅定时聊天回顾
-    /unsubscribe_recap - 取消订阅定时聊天回顾
   cancel: "已经没有正在进行的操作了"
+  # 对照 Go `pkg/bots/tgbot/help_command.go:44-101`：/help 由已注册的指令组动态
+  # 组装而成，而非单一静态文本；以下 key 对照 Go `locales/zh-CN.yaml` 的
+  # system.commands.groups.basic.* 结构，供 build_help_message
+  # （src/bot/handlers/system.rs）组装使用。聊天回顾指令组的组名与各指令说明
+  # 是 Go 源码里的字面量，不经过 i18n（见 system.rs 的 RECAP_GROUP），因此
+  # 不在此列出。
+  commands:
+    groups:
+      basic:
+        name: "基础命令"
+        commands:
+          help:
+            help: "获取帮助"
+            message: |
+              你好！👋 欢迎使用 Insights Bot！
+
+              我当前支持这些命令：
+
+              {Commands}
+          cancel:
+            help: "取消当前操作"
+          start:
+            help: "开始与 Bot 的交互"
 
 # 回顾相关消息
 recap:

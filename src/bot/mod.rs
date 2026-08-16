@@ -73,13 +73,25 @@ pub async fn run(ctx: Arc<AppContext>) -> Result<BotHandle> {
 }
 
 /// Register bot commands with Telegram using setMyCommands API.
+///
+/// Go has no equivalent of this menu registration -- it is a decided,
+/// kept-as-is Rust-only addition -- but each description's *content* is
+/// aligned with the same Go strings `/help` renders (see
+/// `handlers::system::BASIC_GROUP` and `RECAP_GROUP`), including the recap
+/// group's Go quirk of always being Simplified Chinese regardless of
+/// locale. This stays static English/Chinese literals rather than an i18n
+/// lookup, since `setMyCommands` is called once at startup with no
+/// per-viewer locale to key off of.
 async fn register_commands(bot: &Bot) -> Result<()> {
     let commands = vec![
-        BotCommand::new("start", "Show welcome message"),
-        BotCommand::new("help", "Show help"),
-        BotCommand::new("cancel", "Cancel current operation"),
-        BotCommand::new("recap", "Generate chat recap"),
-        BotCommand::new("configure_recap", "Configure recap settings"),
+        BotCommand::new("start", "Begin interacting with the bot"),
+        BotCommand::new("help", "Obtain assistance"),
+        BotCommand::new("cancel", "Cancel any ongoing operations."),
+        BotCommand::new("recap", "总结过去的聊天记录并生成回顾快报"),
+        BotCommand::new(
+            "configure_recap",
+            "配置聊天记录回顾（需要管理权限，<b>请在配置的时候尽量避免使用匿名用户身份或者其他群组的身份进行配置，可能会导致权限检查异常而配置失败。</b>）",
+        ),
         BotCommand::new(
             "recap_forwarded_start",
             "使 Bot 接收在私聊中转发给 Bot 的消息，并在发送 /recap_forwarded 后开始总结",

@@ -92,7 +92,11 @@ async fn handle_bot_join_chat(
     }
 
     let text = context.i18n.t(
-        locale_from_code(language),
+        // Go's `Context.Language()` falls back to the literal `"en"` here,
+        // not any operator-configured default, so this call site keeps that
+        // narrow fallback rather than widening it to `context.config.locale`
+        // (see `Locale::from_language_code`).
+        Locale::from_language_code(Some(language), Locale::En),
         "welcome.message_normal_group",
         &[("Username", me.username())],
     );
@@ -116,15 +120,5 @@ fn chat_type_str(chat: &teloxide::types::Chat) -> &'static str {
         "channel"
     } else {
         "group"
-    }
-}
-
-/// Map a stored/raw language code to a [`Locale`], defaulting to English
-/// exactly like [`Locale::from_lookup`] does for an unrecognized code.
-fn locale_from_code(code: &str) -> Locale {
-    match code {
-        "zh-Hans" => Locale::ZhHans,
-        "zh-Hant" => Locale::ZhHant,
-        _ => Locale::En,
     }
 }
