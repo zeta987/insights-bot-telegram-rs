@@ -236,12 +236,18 @@ explicit approval.
 
 ## Next required slice
 
-Every in-scope non-`/smr` Telegram callsite now has a Rust equivalent or a
-documented approved deviation, and the audit's test-backfill pool is closed
-except for the module-private autorecap internals noted above. The remaining
-work is decision-bound rather than mechanical: resolve the deferred parity
-decisions above with the user, then optionally run the live Telegram test —
-port 9487 and AyuGram are available after local verification.
+ADR 0001 is fully implemented. Six slices landed after the ruling: bare
+`ExceptionError` edits, the Go startup/health/shutdown lifecycle with
+`HEALTH_HTTP_PORT`, surfaced queue failures, the doc-hidden awaitable
+autorecap seam with its integration tests, and the Telegraph plus
+`CommandRateLimiter` removals including their dependencies. Every in-scope
+non-`/smr` Telegram callsite matches pinned Go or appears in
+`docs/parity/go-parity-deviations.md`, and the test pool is closed except
+the `AUTO_RECAP_TEST_ENABLED` immediate path recorded there.
+
+Nothing mechanical remains. Open items are the owner's: push the remaining
+local commits when ready, and optionally run the live Telegram test — port
+9487 and AyuGram are available after local verification.
 
 ## Mandatory repository rules
 

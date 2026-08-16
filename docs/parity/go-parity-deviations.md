@@ -44,6 +44,10 @@ ruled.
 
 ## Test-only seams
 
-- The automatic-recap internals expose a crate-visible awaitable seam so
-  integration tests can synchronise without sleep/poll loops, which this
-  repository forbids. Production behavior is unchanged.
+- `handle_auto_recap_capsule` and `generate_and_deliver_auto_recap` are
+  `#[doc(hidden)] pub` test seams, and the capsule handler returns its
+  preparation plus the Generate branch's `JoinHandle` so integration tests
+  can await completion without sleep/poll loops, which this repository
+  forbids. The production caller inspects only errors, so behavior is
+  unchanged. The `AUTO_RECAP_TEST_ENABLED` immediate-dispatch path remains
+  untested because making it awaitable would change the startup signature.
