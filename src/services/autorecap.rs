@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use teloxide::{prelude::*, types::ChatFullInfo};
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -460,11 +461,39 @@ impl AutoRecapStartupSeeder for DatabaseAutoRecapStartupSeeder<'_> {
     }
 }
 
-async fn handle_auto_recap_capsule(
+/// Everything one dispatched capsule produced: the resolved
+/// [`AutoRecapPreparation`] and, for the `Generate` branch, the spawned
+/// generation task's `JoinHandle`.
+///
+/// `#[doc(hidden)]`: not a supported public API. It exists only so this
+/// crate's integration tests can observe which branch a capsule took and
+/// await the `Generate` branch's generation task deterministically, instead
+/// of sleeping or polling for it (ADR 0001 decision 10, ports Go's
+/// TimeCapsule dispatch without that synchronization escape hatch).
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct AutoRecapCapsuleDispatch {
+    pub preparation: AutoRecapPreparation,
+    pub generation: Option<JoinHandle<()>>,
+}
+
+/// Dispatch on one popped capsule's [`AutoRecapPreparation`], matching Go's
+/// TimeCapsule digger.
+///
+/// `#[doc(hidden)]`: kept `pub` only so integration tests outside this crate
+/// can drive it directly and await the `Generate` branch's spawned task via
+/// [`AutoRecapCapsuleDispatch::generation`] (ADR 0001 decision 10). This
+/// changes no production behavior: `run_autorecap_poll_loop`, the only
+/// production caller, only ever inspects the `Err` case, so returning a
+/// richer `Ok` payload is invisible to it, and the `Generate` arm still
+/// spawns fire-and-forget exactly as before — dropping a `JoinHandle`
+/// neither cancels nor blocks on its task.
+#[doc(hidden)]
+pub async fn handle_auto_recap_capsule(
     ctx: Arc<AppContext>,
     state: Arc<dyn RecapStateStore>,
     chat_id: i64,
-) -> Result<()> {
+) -> Result<AutoRecapCapsuleDispatch> {
     let preparation = prepare_auto_recap(
         &ctx.db,
         state.as_ref(),
@@ -474,21 +503,25 @@ async fn handle_auto_recap_capsule(
     )
     .await?;
 
-    match preparation {
+    let generation = match &preparation {
         AutoRecapPreparation::Disabled => {
             info!(chat_id, "automatic recap is disabled; capsule discarded");
+            None
         }
         AutoRecapPreparation::PrivateWithoutSubscribers { .. } => {
             info!(
                 chat_id,
                 "private-only automatic recap has no subscribers; generation skipped"
             );
+            None
         }
         AutoRecapPreparation::Generate {
             options,
             subscribers,
         } => {
-            tokio::spawn(async move {
+            let options = options.clone();
+            let subscribers = subscribers.clone();
+            Some(tokio::spawn(async move {
                 if let Err(source) =
                     generate_and_deliver_auto_recap(ctx, state, chat_id, options, subscribers).await
                 {
@@ -498,13 +531,27 @@ async fn handle_auto_recap_capsule(
                         "automatic recap generation failed"
                     );
                 }
-            });
+            }))
         }
-    }
-    Ok(())
+    };
+
+    Ok(AutoRecapCapsuleDispatch {
+        preparation,
+        generation,
+    })
 }
 
-async fn generate_and_deliver_auto_recap(
+/// Fetch chat state, generate the detailed and condensed summaries, and
+/// deliver the composed Rich recap to every target.
+///
+/// `#[doc(hidden)]`: not a supported public API. It is `pub` only as a test
+/// seam (ADR 0001 decision 10) so integration tests can exercise this whole
+/// pipeline directly — including the "not enough histories" short-circuit —
+/// without going through the queue and without sleeping or polling. The only
+/// production caller remains the `Generate` arm of
+/// [`handle_auto_recap_capsule`], unchanged.
+#[doc(hidden)]
+pub async fn generate_and_deliver_auto_recap(
     ctx: Arc<AppContext>,
     state: Arc<dyn RecapStateStore>,
     chat_id: i64,
