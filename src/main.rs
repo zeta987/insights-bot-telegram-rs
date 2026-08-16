@@ -108,8 +108,16 @@ async fn wait_for_shutdown_signal() {
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("received Ctrl+C");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("received Ctrl+C"),
+            Err(source) => {
+                // A registration failure must not read as a shutdown signal:
+                // a detached/console-less process would otherwise tear itself
+                // down immediately after startup.
+                warn!(error = %source, "Ctrl+C handler unavailable; running until killed");
+                std::future::pending::<()>().await;
+            }
+        }
     }
 }
 

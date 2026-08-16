@@ -104,8 +104,17 @@ async fn run_polling(bot: Bot, ctx: Arc<AppContext>) -> Result<BotHandle> {
     info!("starting telegram dispatcher (long-polling mode)");
     let mut dispatcher = router::build_dispatcher(bot, ctx);
     let shutdown_token = dispatcher.shutdown_token();
-    let join_handle = tokio::spawn(async move {
-        dispatcher.dispatch().await;
+    // teloxide 0.14's dispatch loop synchronously parks its calling thread
+    // (`std::thread::scope` + `Thread::park` in dispatcher.rs:416) while the
+    // real work runs on teloxide's own internal runtime. Parking a runtime
+    // worker orphans this runtime's IO driver and starves every other task,
+    // so the dispatcher gets a blocking-pool thread, which exists to be
+    // blocked.
+    let handle = tokio::runtime::Handle::current();
+    let join_handle = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            dispatcher.dispatch().await;
+        });
     });
     Ok(BotHandle {
         shutdown_token,
@@ -134,10 +143,15 @@ async fn run_webhook(bot: Bot, ctx: Arc<AppContext>, webhook_url: &str) -> Resul
 
     let mut dispatcher = router::build_dispatcher(bot, ctx);
     let shutdown_token = dispatcher.shutdown_token();
-    let join_handle = tokio::spawn(async move {
-        dispatcher
-            .dispatch_with_listener(listener, LoggingErrorHandler::new())
-            .await;
+    // Same blocking-pool placement as `run_polling`: the dispatch loop parks
+    // its thread for the process lifetime.
+    let handle = tokio::runtime::Handle::current();
+    let join_handle = tokio::task::spawn_blocking(move || {
+        handle.block_on(async move {
+            dispatcher
+                .dispatch_with_listener(listener, LoggingErrorHandler::new())
+                .await;
+        });
     });
 
     Ok(BotHandle {
